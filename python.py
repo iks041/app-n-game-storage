@@ -1,12 +1,228 @@
+import base64
+import logging
 import math
+import queue
 import random
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
 import time
 import tkinter as tk
+import wave
+
+if sys.platform == "win32":
+    import winsound
 
 
 WIDTH = 960
 HEIGHT = 640
 ARENA = (24, 92, WIDTH - 24, HEIGHT - 48)
+REGIONS = [
+    ("ASHEN FRONT", "#45544a", "#b7955f", "#60725c"),
+    ("FROSTLINE PASS", "#496777", "#b2d8e6", "#617d89"),
+    ("REDSTONE WASTES", "#704b3c", "#dd9b62", "#8e6245"),
+    ("IRONWOOD", "#3f6749", "#9bb96d", "#577752"),
+]
+REGION_ACCENTS = ("#f1b85a", "#8ee5f0", "#ff8c54", "#a5d46d")
+ROMAN_NUMERALS = ("I", "II", "III", "IV", "V", "VI", "VII", "VIII")
+QUEST_OPTIONS = (
+    ("CLEAR THE HALL", "Defeat 6 enemies", 6),
+    ("HARDEN THE FRONT", "Defeat 9 enemies", 9),
+    ("SWEEP THE FLOOR", "Defeat 12 enemies", 12),
+)
+QUEST_REWARD_BONUSES = (0, 10, 20)
+TOWER_MINIONS = (
+    ("Vesper, the Glasswing", "A shadow with your face pulled the Demon King through a black gate."),
+    ("Korr, the Chainbound", "The kidnapper steps between moments. Watch for the space bending behind you."),
+    ("Nhalia, the Ash Seer", "Five seals bind the Demon King. Each of us carried one clue."),
+    ("Drazhul, the Gate Eater", "The last seal opens a shortcut. Seek the throne passage, not the long stairs."),
+    ("Mordane, the Hollow Fang", "The one who took him is his own shadow, wearing a stolen shape."),
+)
+BOSS_SKILLS = (
+    ("Groundsplit", 'Earth, answer me! Groundsplit!',
+     "You have earned my Groundsplit. Make it count."),
+    ("Frost Nova", 'Winter, rise! Frost Nova!',
+     "Take my Frost Nova. Let the cold guard your path."),
+    ("Ember Volley", 'Burn bright! Ember Volley!',
+     "The Ember Volley is yours. Aim true, little spark."),
+    ("Ironbark Guard", 'Roots, guard me! Ironbark Guard!',
+     "My Ironbark Guard is yours. Stand firm."),
+)
+BOSS_DIALOGUES = (
+    "I WILL KILL YOU!",
+    "ONLY DEATH AWAITS YOU!",
+    "NO ONE CAN SAVE YOU FROM THE WRATH OF MY SKILLS!",
+    "YOUR LAST STAND ENDS HERE!",
+)
+BOSS_DEFEAT_DIALOGUE = (
+    "I acknowledge your power and might to kill me. I give you my skill."
+)
+COSMETIC_ITEMS = {
+    "HAIR": (
+        ("Close Crop", 0, "#4b4238"),
+        ("Ranger Sweep", 18, "#c9a65a"),
+        ("Wild Tuft", 30, "#6a493c"),
+        ("Silver Crest", 45, "#b9c3c0"),
+    ),
+    "GUN": (
+        ("Service Rifle", 0, "#858678"),
+        ("Scattergun", 25, "#c47c4c"),
+        ("Longshot", 35, "#81a4b0"),
+        ("Ember Carbine", 50, "#e07a45"),
+        ("Warden Breaker", 0, "#f0c45a"),
+    ),
+    "GLOVES": (
+        ("Field Wraps", 0, "#303530"),
+        ("Leather Grips", 15, "#9a6848"),
+        ("Iron Gauntlets", 30, "#9da6a2"),
+        ("Frost Gloves", 45, "#8ee5f0"),
+    ),
+    "MASK": (
+        ("No Mask", 0, ""),
+        ("Cloth Mask", 20, "#b69a75"),
+        ("Iron Visor", 35, "#899b9d"),
+        ("Ashen Mask", 50, "#6e7774"),
+    ),
+    "OUTFIT": (
+        ("Scout Jacket", 0, "#72a2ad"),
+        ("Wasteland Coat", 35, "#9f7352"),
+        ("Frost Mantle", 45, "#779da8"),
+        ("Ironwood Armor", 55, "#687e58"),
+    ),
+}
+
+
+class GameAudio:
+    def __init__(self, root):
+        self.root = root
+        self._directory = tempfile.TemporaryDirectory(prefix="ashen_front_audio_")
+        self._sounds = {}
+        self._voice_queue = queue.Queue(maxsize=3)
+        self._voice_process = None
+        self._voice_thread = None
+        for name, start_hz, end_hz, duration, volume in (
+            ("shot", 1250, 260, 0.075, 0.65),
+            ("kill", 390, 1050, 0.16, 0.7),
+            ("impact", 310, 115, 0.09, 0.5),
+        ):
+            path = f"{self._directory.name}\\{name}.wav"
+            self._write_tone(path, start_hz, end_hz, duration, volume)
+            self._sounds[name] = path
+        if sys.platform == "win32":
+            self._voice_thread = threading.Thread(
+                target=self._voice_worker, daemon=True
+            )
+            self._voice_thread.start()
+
+    @staticmethod
+    def _write_tone(path, start_hz, end_hz, duration, volume):
+        sample_rate = 22050
+        sample_count = int(sample_rate * duration)
+        samples = bytearray()
+        phase = 0.0
+        for index in range(sample_count):
+            progress = index / max(1, sample_count - 1)
+            frequency = start_hz + (end_hz - start_hz) * progress
+            phase += 2 * math.pi * frequency / sample_rate
+            envelope = min(
+                1.0,
+                index / (sample_rate * 0.008),
+                (sample_count - index) / (sample_rate * 0.018),
+            )
+            value = int(32767 * volume * max(0, envelope) * math.sin(phase))
+            samples.extend(struct.pack("<h", value))
+        with wave.open(path, "wb") as audio_file:
+            audio_file.setnchannels(1)
+            audio_file.setsampwidth(2)
+            audio_file.setframerate(sample_rate)
+            audio_file.writeframes(samples)
+
+    def play(self, name):
+        if sys.platform == "win32":
+            try:
+                winsound.PlaySound(
+                    self._sounds[name],
+                    winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT,
+                )
+            except (OSError, RuntimeError):
+                logging.exception("Could not play the %s sound effect", name)
+        else:
+            self.root.bell()
+
+    def speak(self, text):
+        if sys.platform != "win32":
+            return
+        try:
+            self._voice_queue.put_nowait(text)
+        except queue.Full:
+            try:
+                self._voice_queue.get_nowait()
+            except queue.Empty:
+                pass
+            self._voice_queue.put_nowait(text)
+
+    def _voice_worker(self):
+        script = """
+Add-Type -AssemblyName System.Speech
+$voice = New-Object System.Speech.Synthesis.SpeechSynthesizer
+$voice.Volume = 82
+while (($line = [Console]::In.ReadLine()) -ne $null) {
+    $text = [Text.Encoding]::UTF8.GetString(
+        [Convert]::FromBase64String($line)
+    )
+    $voice.Speak($text)
+}
+$voice.Dispose()
+"""
+        encoded_script = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+        try:
+            process = subprocess.Popen(
+                ["powershell.exe", "-NoProfile", "-NonInteractive",
+                 "-EncodedCommand", encoded_script],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                text=True,
+                encoding="ascii",
+                bufsize=1,
+            )
+        except OSError:
+            logging.exception("Could not start Windows speech synthesis")
+            return
+        self._voice_process = process
+        while True:
+            text = self._voice_queue.get()
+            if text is None:
+                break
+            if process.poll() is not None:
+                logging.error("Windows speech synthesis exited unexpectedly")
+                return
+            try:
+                encoded_text = base64.b64encode(text.encode("utf-8")).decode("ascii")
+                process.stdin.write(encoded_text + "\n")
+                process.stdin.flush()
+            except (BrokenPipeError, OSError):
+                logging.exception("Could not send dialogue to Windows speech synthesis")
+                return
+        process.stdin.close()
+
+    def close(self):
+        while True:
+            try:
+                self._voice_queue.get_nowait()
+            except queue.Empty:
+                break
+        self._voice_queue.put(None)
+        if sys.platform == "win32":
+            try:
+                winsound.PlaySound(None, winsound.SND_PURGE)
+            except (OSError, RuntimeError):
+                logging.exception("Could not stop the current sound effect")
+            if self._voice_process and self._voice_process.poll() is None:
+                self._voice_process.terminate()
+        self._directory.cleanup()
 
 
 class BattlefieldRPG:
@@ -19,15 +235,40 @@ class BattlefieldRPG:
         )
         self.canvas.pack()
         self.canvas.bind("<Button-1>", self.on_click)
+        self.canvas.bind("<Motion>", self.on_mouse_move)
         self.root.bind("<KeyPress>", self.on_key_down)
         self.root.bind("<KeyRelease>", self.on_key_up)
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
 
         self.keys = set()
         self.decor = self.make_decor()
+        mote_rng = random.Random(731)
+        self.ambient_motes = [
+            (
+                mote_rng.random(),
+                mote_rng.random(),
+                mote_rng.uniform(7, 24),
+                mote_rng.uniform(0, math.tau),
+                mote_rng.choice((2, 3, 4)),
+            )
+            for _ in range(18)
+        ]
+        self.mouse_position = (WIDTH / 2 + 100, HEIGHT / 2)
         self.state = "menu"
         self.last_tick = time.monotonic()
+        self.audio = GameAudio(root)
+        self.owned_cosmetics = {
+            category: {items[0][0]} for category, items in COSMETIC_ITEMS.items()
+        }
+        self.equipped_cosmetics = {
+            category: items[0][0] for category, items in COSMETIC_ITEMS.items()
+        }
+        self.customize_category = 0
+        self.customize_item = 0
+        self.pending_cosmetic_chest = None
         self.new_game()
         self.state = "menu"
+        self.draw_background()
         self.tick()
 
     def make_decor(self):
@@ -55,34 +296,232 @@ class BattlefieldRPG:
             "attack_until": 0,
             "attack_ready": 0,
             "hurt_until": 0,
+            "shoot_until": 0,
+            "ability_ready": 0,
+            "ability_until": 0,
+            "knockdown_until": 0,
+            "shield_until": 0,
         }
         self.enemies = []
         self.pickups = []
+        self.projectiles = []
+        self.effects = []
+        self.boss_corpses = []
+        self.boss_chests = []
         self.wave = 1
-        self.wave_left = 5
+        self.wave_left = 0
         self.wave_pause = 0
         self.kills = 0
+        self.coins = 0
+        self.auto_aim_enabled = False
+        self.region = 0
+        self.territories = [False] * len(REGIONS)
+        self.territories[0] = True
+        self.has_boss_ability = False
+        self.unlocked_abilities = []
+        self.active_ability = 0
         self.message = ""
         self.message_until = 0
+        self.weapon_upgrade = 0
+        self.skill_upgrade = 0
+        self.health_upgrade = 0
+        self.stage_intro_until = 0
+        self.boss_warning_until = 0
+        self.boss_cutscene_until = 0
+        self.boss_dialogue_until = 0
+        self.skill_acquire_progress = 0
+        self.pending_skill = None
+        self.boss_weapon_owned = False
+        self.advanced_gun_owned = "Warden Breaker" in self.owned_cosmetics["GUN"]
+        self.quests_completed = set()
+        self.active_quest = None
+        self.quest_progress = 0
+        self.quest_reward = 0
+        self.quest_rewards = []
+        self.quest_complete = False
+        self.tower_clues = []
+        self.rescue_route_unlocked = False
+        self.rescue_battle = False
+        self.demon_ally_next_attack = 0
+        self.kidnapper_reveal_until = 0
+        self.opening_cutscene_started = 0
+        self.last_spoken_dialogue = None
+        self.clue_dialogue = ""
+        self.post_boss_at = 0
+        self.travel_ready_at = 0
+        self.shop_return_state = "post_boss"
+        self.map_return_state = "playing"
         self.spawn_wave()
 
+    def stage_number(self):
+        return (self.wave - 1) // 4 + 1
+
+    def stage_label(self):
+        return f"FLOOR {min(100, self.stage_number())}/100"
+
     def spawn_wave(self):
-        self.wave_left = 4 + self.wave * 2
-        self.message = "WAVE " + str(self.wave) + "  -  HOLD THE LINE"
+        if self.wave % 4 == 0:
+            self.wave_left = 1
+            self.message = "BOSS WAVE  -  " + self.boss_name()
+            self.state = "boss_warning"
+            self.boss_warning_until = time.monotonic() + 3
+        else:
+            self.wave_left = 4 + self.wave * 2
+            stage = ROMAN_NUMERALS[(self.stage_number() - 1) % len(ROMAN_NUMERALS)]
+            stage_wave = (self.wave - 1) % 4 + 1
+            self.message = f"STAGE {stage}  -  WAVE {stage_wave}/3  -  HOLD THE LINE"
         self.message_until = time.monotonic() + 2.2
 
+    def boss_name(self):
+        if self.rescue_battle:
+            return "The Veil Thief"
+        floor = self.stage_number()
+        if floor % 5 == 0:
+            return TOWER_MINIONS[(floor // 5 - 1) % len(TOWER_MINIONS)][0]
+        names = ("The Faultkeeper", "Rimebreaker", "The Red Maw", "Ironwood Colossus")
+        return names[(self.wave // 4 - 1) % len(names)]
+
+    def boss_dialogue(self):
+        if self.rescue_battle:
+            return "Your borrowed weapon cannot touch the truth behind me!"
+        floor = self.stage_number()
+        if floor % 5 == 0:
+            return TOWER_MINIONS[(floor // 5 - 1) % len(TOWER_MINIONS)][1]
+        return BOSS_DIALOGUES[(self.wave // 4 - 1) % len(BOSS_DIALOGUES)]
+
+    def boss_skill(self):
+        return BOSS_SKILLS[(self.wave // 4 - 1) % len(BOSS_SKILLS)]
+
     def on_click(self, event):
+        if self.state == "tower_exterior":
+            if 340 <= event.x <= 620 and 330 <= event.y <= 500:
+                self.start_opening_cutscene()
+            return
+        if self.state == "tower_gate":
+            self.message = "FIND THE PORTAL BEHIND THE THRONE, THEN PRESS E"
+            self.message_until = time.monotonic() + 1.5
+            return
+        if self.state == "quest_select":
+            for index in range(len(QUEST_OPTIONS)):
+                x1 = 80 + index * 275
+                if x1 <= event.x <= x1 + 245 and 285 <= event.y <= 470:
+                    self.accept_quest(index)
+                    return
+            return
+        if self.state == "character":
+            self.handle_character_click(event.x, event.y)
+            return
+        if self.state == "cosmetic_chest":
+            self.handle_cosmetic_chest_click(event.x, event.y)
+            return
+        if self.state in ("playing", "post_boss", "boss_skill"):
+            if self.handle_boss_chest_click(event.x, event.y):
+                return
+        if (self.state in ("playing", "post_boss")
+                and 812 <= event.x <= 936 and 61 <= event.y <= 87):
+            self.auto_aim_enabled = not self.auto_aim_enabled
+            status = "ON" if self.auto_aim_enabled else "OFF"
+            self.message = f"AUTO AIM {status} FOR THIS STAGE"
+            self.message_until = time.monotonic() + 1.5
+            return
+        if self.state == "auto_aim_prompt":
+            if 280 <= event.y <= 360:
+                if 170 <= event.x <= 460:
+                    self.resolve_auto_aim_prompt(True)
+                elif 500 <= event.x <= 790:
+                    self.resolve_auto_aim_prompt(False)
+            return
+        if self.state == "paused":
+            if 370 <= event.x <= 590 and 320 <= event.y <= 370:
+                self.state = "playing"
+                self.last_tick = time.monotonic()
+            elif 370 <= event.x <= 590 and 390 <= event.y <= 440:
+                self.state = "character"
+            return
+        if self.state == "shop":
+            self.handle_shop_click(event.x, event.y)
+            return
+        if self.state == "region_map":
+            if event.y > 320:
+                region_index = min(len(REGIONS) - 1, max(0, (event.x - 70) // 210))
+                self.claim_region(region_index)
+            return
+        if self.state == "post_boss":
+            shop_left, shop_right = ((80, 260) if self.rescue_route_unlocked
+                                     else (100, 300))
+            terrain_left, terrain_right = ((270, 450) if self.rescue_route_unlocked
+                                           else (320, 520))
+            if 545 <= event.y <= 600 and shop_left <= event.x <= shop_right:
+                self.open_shop()
+                return
+            elif 545 <= event.y <= 600 and terrain_left <= event.x <= terrain_right:
+                if time.monotonic() >= self.travel_ready_at:
+                    self.map_return_state = "post_boss"
+                    self.state = "region_map"
+                else:
+                    self.message = f"TRAVEL OPENS IN {self.travel_ready_at - time.monotonic():.1f} SECONDS"
+                    self.message_until = time.monotonic() + 1
+                return
+            if self.rescue_route_unlocked and 545 <= event.y <= 600 and 470 <= event.x <= 670:
+                self.start_rescue_route()
+                return
+            continue_x1 = 700 if self.rescue_route_unlocked else 650
+            continue_x2 = 890 if self.rescue_route_unlocked else 850
+            if (545 <= event.y <= 600 and continue_x1 <= event.x <= continue_x2
+                    and time.monotonic() >= self.travel_ready_at):
+                self.continue_stage()
+                return
+            elif (545 <= event.y <= 600 and continue_x1 <= event.x <= continue_x2):
+                self.message = f"STAY AND COLLECT COINS FOR {self.travel_ready_at - time.monotonic():.1f} MORE SECONDS"
+                self.message_until = time.monotonic() + 1
+                return
+            dx, dy = event.x - self.player["x"], event.y - self.player["y"]
+            self.shoot(time.monotonic(), dx, dy)
+            return
         if self.state in ("menu", "gameover"):
-            self.start_game()
-        elif self.state == "paused":
+            self.start_game() if self.state == "menu" else self.restart_stage()
+        elif self.state == "stage_intro":
             self.state = "playing"
-            self.last_tick = time.monotonic()
+        elif self.state == "playing":
+            dx, dy = event.x - self.player["x"], event.y - self.player["y"]
+            self.shoot(time.monotonic(), dx, dy)
+
+    def on_mouse_move(self, event):
+        self.mouse_position = (event.x, event.y)
 
     def on_key_down(self, event):
         key = event.keysym.lower()
+        was_down = key in self.keys
         self.keys.add(key)
-        if key in ("return", "space") and self.state in ("menu", "gameover"):
+        if key in ("return", "space") and self.state == "menu":
             self.start_game()
+        elif key in ("return", "space") and self.state == "gameover":
+            self.restart_stage()
+        elif key == "1" and not was_down and self.state == "playing":
+            self.use_boss_ability(time.monotonic())
+        elif key == "2" and not was_down and self.state == "playing":
+            self.select_next_ability(time.monotonic())
+        elif key == "m" and not was_down and self.state in ("playing", "post_boss"):
+            if self.state == "post_boss" and time.monotonic() < self.travel_ready_at:
+                remaining = self.travel_ready_at - time.monotonic()
+                self.message = f"TRAVEL OPENS IN {remaining:.1f} SECONDS"
+                self.message_until = time.monotonic() + 1
+                return
+            self.map_return_state = self.state
+            self.state = "region_map"
+        elif key == "b" and not was_down and self.state == "post_boss":
+            self.open_shop()
+        elif key == "c" and not was_down and self.state == "paused":
+            self.state = "character"
+        elif key == "return" and self.state == "stage_intro":
+            self.state = "playing"
+        elif key in ("e", "return", "space") and self.state == "tower_exterior":
+            self.start_opening_cutscene()
+        elif key == "e" and self.state == "tower_gate":
+            gate_x, gate_y = WIDTH / 2, ARENA[1] + 208
+            if math.hypot(self.player["x"] - gate_x,
+                          self.player["y"] - gate_y) <= 68:
+                self.enter_tower_floor()
         elif key == "escape":
             if self.state == "playing":
                 self.state = "paused"
@@ -90,18 +529,112 @@ class BattlefieldRPG:
             elif self.state == "paused":
                 self.state = "playing"
                 self.last_tick = time.monotonic()
+            elif self.state == "shop":
+                self.state = self.shop_return_state
+            elif self.state == "region_map":
+                self.state = self.map_return_state
+            elif self.state == "character":
+                self.state = "paused"
+            elif self.state == "auto_aim_prompt":
+                self.resolve_auto_aim_prompt(False)
 
     def on_key_up(self, event):
         self.keys.discard(event.keysym.lower())
 
     def start_game(self):
         self.new_game()
-        self.state = "playing"
+        self.state = "tower_exterior"
+        self.player["x"] = WIDTH / 2
+        self.player["y"] = HEIGHT - 100
         self.keys.clear()
         self.last_tick = time.monotonic()
+        self.canvas.delete("background")
+        self.draw_background()
         self.canvas.focus_set()
 
+    def close(self):
+        self.audio.close()
+        self.root.destroy()
+
+    def speak_dialogue(self, text):
+        if text and text != self.last_spoken_dialogue:
+            self.last_spoken_dialogue = text
+            self.audio.speak(text)
+
+    def start_opening_cutscene(self):
+        self.state = "opening_cutscene"
+        self.opening_cutscene_started = time.monotonic()
+        self.last_spoken_dialogue = None
+        self.keys.clear()
+
+    def enter_tower_floor(self):
+        self.wave = 1
+        self.wave_pause = 0
+        self.enemies.clear()
+        self.pickups.clear()
+        self.projectiles.clear()
+        self.effects.clear()
+        self.player["x"] = WIDTH / 2
+        self.player["y"] = (ARENA[1] + ARENA[3]) / 2
+        self.state = "quest_select"
+        self.prepare_quest_options()
+        self.keys.clear()
+
+    def prepare_quest_options(self):
+        floor = min(100, self.stage_number())
+        floor_reward = min(80, 50 + ((floor - 1) // 25) * 10)
+        self.quest_rewards = [
+            floor_reward + bonus for bonus in QUEST_REWARD_BONUSES
+        ]
+        self.quest_reward = self.quest_rewards[0]
+
+    def accept_quest(self, quest_index):
+        if not 0 <= quest_index < len(QUEST_OPTIONS):
+            return
+        self.active_quest = QUEST_OPTIONS[quest_index]
+        self.quest_reward = self.quest_rewards[quest_index]
+        self.quest_progress = 0
+        self.quest_complete = False
+        self.begin_stage()
+
+    def restart_stage(self):
+        stage_start_wave = (self.stage_number() - 1) * 4 + 1
+        self.player.update(
+            x=WIDTH / 2,
+            y=(ARENA[1] + ARENA[3]) / 2,
+            hp=self.player["max_hp"],
+            hurt_until=0,
+            knockdown_until=0,
+            shield_until=0,
+            attack_ready=0,
+            ability_ready=0,
+        )
+        self.enemies.clear()
+        self.pickups.clear()
+        self.projectiles.clear()
+        self.effects.clear()
+        self.wave = stage_start_wave
+        self.wave_pause = 0
+        self.pending_skill = None
+        self.skill_acquire_progress = 0
+        self.wave_left = 0
+        self.state = "stage_intro"
+        self.stage_intro_until = time.monotonic() + 2.2
+        self.keys.clear()
+        self.canvas.delete("background")
+        self.draw_background()
+        self.spawn_wave()
+        self.message = f"{self.stage_label()} RESTARTED"
+        self.message_until = self.stage_intro_until
+        self.last_tick = time.monotonic()
+
     def spawn_enemy(self):
+        if self.wave % 4 == 0:
+            if self.state == "playing":
+                self.state = "boss_warning"
+                self.boss_warning_until = time.monotonic() + 3
+            return
+
         side = random.randrange(4)
         if side == 0:
             x, y = random.uniform(ARENA[0], ARENA[2]), ARENA[1] + 12
@@ -138,13 +671,266 @@ class BattlefieldRPG:
         )
         self.wave_left -= 1
 
+    def spawn_boss(self):
+        x, y = ARENA[2] - 75, ARENA[1] + 85
+        is_rescue_boss = self.rescue_battle and self.stage_number() == 100
+        is_minion_boss = self.stage_number() % 5 == 0 and not is_rescue_boss
+        kind = "kidnapper" if is_rescue_boss else (
+            "minion_boss" if is_minion_boss else "boss"
+        )
+        minion_clue = None
+        if is_minion_boss:
+            clue_index = min(self.stage_number() // 5 - 1, len(TOWER_MINIONS) - 1)
+            minion_clue = TOWER_MINIONS[clue_index][1]
+        base_hp = 520 + (self.wave // 4 - 1) * 160
+        if is_rescue_boss:
+            base_hp = 4200
+        elif is_minion_boss:
+            base_hp = max(600, base_hp // 2)
+        self.enemies.append(
+            {
+                "x": x,
+                "y": y,
+                "hp": base_hp,
+                "max_hp": base_hp,
+                "speed": 36 if is_minion_boss else 42,
+                "damage": 8 if is_minion_boss else 15,
+                "xp": 100,
+                "radius": 30,
+                "kind": kind,
+                "attack_ready": 0,
+                "hurt_until": 0,
+                "special_ready": time.monotonic() + 2.5,
+                "special_until": 0,
+                "special_hit": False,
+                "special_line": None,
+                "boss_name": self.boss_name(),
+                "skill": None if is_rescue_boss else self.boss_skill(),
+                "clue": minion_clue,
+                "teleport_ready": time.monotonic() + 3,
+                "clone_ready": time.monotonic() + 5,
+            }
+        )
+
+    def update_flow(self, now):
+        if self.state == "opening_cutscene" and now - self.opening_cutscene_started >= 12:
+            self.state = "tower_gate"
+            self.player["x"] = WIDTH / 2
+            self.player["y"] = HEIGHT - 105
+            self.keys.clear()
+        elif self.state == "stage_intro" and now >= self.stage_intro_until:
+            self.state = "playing"
+        elif self.state == "boss_warning" and now >= self.boss_warning_until:
+            self.spawn_boss()
+            self.wave_left = 0
+            self.state = "playing"
+            self.message = f'{self.boss_name()}: "{self.boss_dialogue()}"'
+            self.message_until = now + 2
+            self.audio.speak(f"{self.boss_name()}: {self.boss_dialogue()}")
+        elif self.state == "boss_cutscene" and now >= self.boss_cutscene_until:
+            self.state = "boss_dialogue"
+            self.boss_dialogue_until = now + 3.2
+        elif self.state == "boss_dialogue" and now >= self.boss_dialogue_until:
+            self.state = "boss_skill"
+            self.skill_acquire_progress = 0
+        elif self.state == "minion_reveal" and now >= self.boss_dialogue_until:
+            self.state = "post_boss"
+            self.travel_ready_at = now
+            self.message = self.clue_dialogue
+            self.message_until = now + 3
+        elif self.state == "kidnapper_reveal" and now >= self.kidnapper_reveal_until:
+            self.state = "victory"
+            self.rescue_battle = False
+
+    def continue_stage(self):
+        if self.stage_number() >= 100:
+            self.message = "THE TOP FLOOR IS THE END OF THE CLIMB."
+            self.message_until = time.monotonic() + 2
+            return
+        self.wave += 1
+        self.wave_pause = 0
+        self.projectiles.clear()
+        self.auto_aim_prompt_default = self.auto_aim_enabled
+        if self.auto_aim_prompt_default:
+            self.state = "auto_aim_prompt"
+            return
+        self.auto_aim_enabled = False
+        self.show_next_quest()
+
+    def resolve_auto_aim_prompt(self, enabled):
+        self.auto_aim_enabled = enabled
+        self.show_next_quest()
+
+    def show_next_quest(self):
+        self.active_quest = None
+        self.prepare_quest_options()
+        self.state = "quest_select"
+
+    def start_rescue_route(self):
+        if not self.rescue_route_unlocked:
+            return
+        self.rescue_battle = True
+        self.active_quest = None
+        self.demon_ally_next_attack = time.monotonic() + 0.8
+        self.wave = 397
+        self.wave_pause = 0
+        self.enemies.clear()
+        self.pickups.clear()
+        self.projectiles.clear()
+        self.effects.clear()
+        self.player["x"] = WIDTH / 2
+        self.player["y"] = (ARENA[1] + ARENA[3]) / 2
+        self.state = "boss_warning"
+        self.boss_warning_until = time.monotonic() + 3
+        self.message = "THE FIVE CLUES OPEN A PATH TO THE TOP FLOOR"
+        self.message_until = self.boss_warning_until
+        self.keys.clear()
+
+    def begin_stage(self):
+        self.state = "stage_intro"
+        self.stage_intro_until = time.monotonic() + 2.2
+        self.spawn_wave()
+        self.message = f"{self.stage_label()}  -  PREPARE FOR BATTLE"
+        self.message_until = self.stage_intro_until
+
+    def open_shop(self):
+        self.shop_return_state = self.state
+        self.state = "shop"
+
+    def handle_shop_click(self, x, y):
+        row = (y - 230) // 72
+        upgrades = (
+            ("weapon", 15 + self.weapon_upgrade * 12),
+            ("skill", 25 + self.skill_upgrade * 15),
+            ("health", 20 + self.health_upgrade * 12),
+        )
+        if 0 <= row < len(upgrades) and 180 <= x <= 780:
+            upgrade, cost = upgrades[row]
+            if self.coins < cost:
+                self.message = f"NOT ENOUGH COINS  -  NEED {cost}"
+                self.message_until = time.monotonic() + 1.5
+                return
+            self.coins -= cost
+            if upgrade == "weapon":
+                self.weapon_upgrade += 1
+            elif upgrade == "skill":
+                self.skill_upgrade += 1
+            else:
+                self.health_upgrade += 1
+                self.player["max_hp"] += 25
+                self.player["hp"] = min(
+                    self.player["max_hp"], self.player["hp"] + 25
+                )
+            self.message = f"{upgrade.upper()} UPGRADED!"
+            self.message_until = time.monotonic() + 1.5
+
+    def handle_character_click(self, x, y):
+        if 70 <= x <= 260 and 550 <= y <= 600:
+            self.state = "paused"
+            return
+        if 125 <= y <= 170:
+            category_index = (x - 30) // 180
+            if 0 <= category_index < len(COSMETIC_ITEMS) and x <= 930:
+                self.customize_category = category_index
+                self.customize_item = 0
+            return
+        category = tuple(COSMETIC_ITEMS)[self.customize_category]
+        items = COSMETIC_ITEMS[category]
+        if 210 <= y <= 488 and 60 <= x <= 600:
+            item_index = (y - 210) // 70
+            if item_index < len(items):
+                self.customize_item = item_index
+            return
+
+        if not (60 <= x <= 600 and 505 <= y <= 550):
+            return
+        name, cost, _ = items[self.customize_item]
+        if name not in self.owned_cosmetics[category]:
+            if self.coins < cost:
+                self.message = f"NOT ENOUGH COINS  -  NEED {cost}"
+                self.message_until = time.monotonic() + 1.5
+                return
+            self.coins -= cost
+            self.pending_cosmetic_chest = (category, name)
+            self.cosmetic_chest_clicks = 0
+            self.state = "cosmetic_chest"
+            return
+        self.equipped_cosmetics[category] = name
+        self.message = f"{name.upper()} EQUIPPED"
+        self.message_until = time.monotonic() + 1.5
+
+    def handle_cosmetic_chest_click(self, x, y):
+        if not (350 <= x <= 610 and 285 <= y <= 455):
+            return
+        self.cosmetic_chest_clicks += 1
+        if self.cosmetic_chest_clicks < 5:
+            return
+        category, name = self.pending_cosmetic_chest
+        self.owned_cosmetics[category].add(name)
+        self.equipped_cosmetics[category] = name
+        self.pending_cosmetic_chest = None
+        self.state = "character"
+        self.message = f"CHEST OPENED  -  {name.upper()} EQUIPPED"
+        self.message_until = time.monotonic() + 2
+
+    def handle_boss_chest_click(self, x, y):
+        for chest in self.boss_chests:
+            if chest["opened"]:
+                continue
+            if abs(x - chest["x"]) <= 24 and abs(y - chest["y"]) <= 18:
+                chest["clicks"] += 1
+                if chest["clicks"] == 5:
+                    chest["opened"] = True
+                    if self.boss_weapon_owned:
+                        self.coins += 40
+                        reward = "40 BONUS COINS"
+                    else:
+                        self.boss_weapon_owned = True
+                        reward = "BOSS WEAPON  -  SKILL COOLDOWN -30%"
+                    self.message = f"BOSS CHEST OPENED  -  {reward}"
+                    self.message_until = time.monotonic() + 3
+                else:
+                    self.message = f"BOSS CHEST  -  {chest['clicks']}/5 CLICKS"
+                    self.message_until = time.monotonic() + 1
+                return True
+        return False
+
+    def update_skill_acquire(self, dt, now):
+        corpse = self.boss_corpses[-1] if self.boss_corpses else None
+        if corpse is None or self.pending_skill is None:
+            return
+        head_x, head_y = corpse["x"] + 22, corpse["y"] - 8
+        distance = math.hypot(
+            self.player["x"] - head_x, self.player["y"] - head_y
+        )
+        if "e" in self.keys and distance <= 82:
+            self.skill_acquire_progress = min(2.5, self.skill_acquire_progress + dt)
+        else:
+            self.skill_acquire_progress = 0
+        if self.skill_acquire_progress < 2.5:
+            return
+
+        skill = self.pending_skill
+        if skill not in self.unlocked_abilities:
+            self.unlocked_abilities.append(skill)
+        self.has_boss_ability = True
+        self.active_ability = self.unlocked_abilities.index(skill)
+        self.pending_skill = None
+        self.skill_acquire_progress = 0
+        self.state = "post_boss"
+        self.travel_ready_at = now
+        self.message = f"SKILL ACQUIRED  -  {skill[0]}"
+        self.message_until = now + 2.5
+
     def update(self, dt, now):
+        if self.state == "boss_skill" and self.pending_skill:
+            self.update_skill_acquire(dt, now)
         p = self.player
         dx = (("d" in self.keys or "right" in self.keys) -
               ("a" in self.keys or "left" in self.keys))
         dy = (("s" in self.keys or "down" in self.keys) -
               ("w" in self.keys or "up" in self.keys))
-        if dx or dy:
+        if (dx or dy) and now >= p["knockdown_until"]:
             length = math.hypot(dx, dy)
             dx, dy = dx / length, dy / length
             p["face"] = (dx, dy)
@@ -153,8 +939,15 @@ class BattlefieldRPG:
             p["x"] = max(ARENA[0] + 16, min(ARENA[2] - 16, p["x"]))
             p["y"] = max(ARENA[1] + 16, min(ARENA[3] - 16, p["y"]))
 
+        mouse_dx = self.mouse_position[0] - p["x"]
+        mouse_dy = self.mouse_position[1] - p["y"]
+        if math.hypot(mouse_dx, mouse_dy) > 8:
+            aim_length = math.hypot(mouse_dx, mouse_dy)
+            p["face"] = (mouse_dx / aim_length, mouse_dy / aim_length)
+
         if "space" in self.keys and now >= p["attack_ready"]:
-            self.attack(now)
+            fx, fy = p["face"]
+            self.shoot(now, fx, fy)
 
         if self.wave_left > 0 and len(self.enemies) < 5 + self.wave:
             self.spawn_enemy()
@@ -163,28 +956,67 @@ class BattlefieldRPG:
             ex, ey = p["x"] - enemy["x"], p["y"] - enemy["y"]
             distance = max(1, math.hypot(ex, ey))
             if distance > enemy["radius"] + 20:
-                enemy["x"] += ex / distance * enemy["speed"] * dt
-                enemy["y"] += ey / distance * enemy["speed"] * dt
-            elif now >= enemy["attack_ready"] and now >= p["hurt_until"]:
-                p["hp"] -= enemy["damage"]
+                speed = enemy["speed"] * (0.45 if now < enemy.get("slowed_until", 0) else 1)
+                enemy["x"] += ex / distance * speed * dt
+                enemy["y"] += ey / distance * speed * dt
+            elif now >= enemy["attack_ready"] and now >= p["hurt_until"] and now >= p["knockdown_until"]:
+                shielded = now < p["shield_until"]
+                if not shielded:
+                    p["hp"] -= enemy["damage"]
                 p["hurt_until"] = now + 0.58
                 enemy["attack_ready"] = now + 0.95
-                self.message = "UNDER ATTACK!"
+                self.message = "IRONBARK GUARD ABSORBS THE HIT!" if shielded else "UNDER ATTACK!"
                 self.message_until = now + 0.65
                 if p["hp"] <= 0:
                     p["hp"] = 0
                     self.state = "gameover"
                     self.keys.clear()
                     return
+            if enemy["kind"] in ("boss", "minion_boss"):
+                self.update_boss(enemy, now)
+            elif enemy["kind"] == "kidnapper":
+                self.update_kidnapper(enemy, now)
 
+        for projectile in self.projectiles[:]:
+            projectile["x"] += projectile["vx"] * dt
+            projectile["y"] += projectile["vy"] * dt
+            projectile["life"] -= dt
+            hit = False
+            for enemy in self.enemies[:]:
+                if math.hypot(projectile["x"] - enemy["x"],
+                              projectile["y"] - enemy["y"]) <= enemy["radius"] + 5:
+                    damage = projectile["damage"]
+                    if enemy["kind"] == "kidnapper":
+                        damage = int(
+                            damage * (2.5 if self.advanced_gun_owned and
+                                      self.equipped_cosmetics["GUN"] == "Warden Breaker"
+                                      else 0.3)
+                        )
+                    enemy["hp"] -= damage
+                    enemy["hurt_until"] = now + 0.1
+                    hit = True
+                    if enemy["hp"] <= 0:
+                        self.defeat_enemy(enemy, now)
+                    break
+            if hit or projectile["life"] <= 0:
+                self.projectiles.remove(projectile)
+
+        self.effects = [effect for effect in self.effects if effect["until"] > now]
+        for effect in self.effects:
+            if effect["kind"] == "shield":
+                effect["x"], effect["y"] = p["x"], p["y"]
         for pickup in self.pickups[:]:
             if math.hypot(p["x"] - pickup["x"], p["y"] - pickup["y"]) < 24:
-                p["hp"] = min(p["max_hp"], p["hp"] + 30)
                 self.pickups.remove(pickup)
-                self.message = "FIELD MEDKIT  +30 HP"
+                if pickup["kind"] == "medkit":
+                    p["hp"] = min(p["max_hp"], p["hp"] + 30)
+                    self.message = "FIELD MEDKIT  +30 HP"
+                else:
+                    self.coins += pickup["value"]
+                    self.message = f"COINS COLLECTED  +{pickup['value']}"
                 self.message_until = now + 1.3
 
-        if not self.enemies and self.wave_left == 0:
+        if self.state == "playing" and not self.enemies and self.wave_left == 0:
             if self.wave_pause == 0:
                 self.wave_pause = now + 1.8
                 self.message = "AREA SECURED"
@@ -194,26 +1026,358 @@ class BattlefieldRPG:
                 self.wave_pause = 0
                 self.spawn_wave()
 
-    def attack(self, now):
+        if self.rescue_battle and now >= self.demon_ally_next_attack:
+            target = next(
+                (enemy for enemy in self.enemies if enemy["kind"] == "kidnapper"),
+                None,
+            )
+            if target:
+                target["hp"] -= 48
+                target["hurt_until"] = now + 0.15
+                self.demon_ally_next_attack = now + 0.85
+                self.effects.append({
+                    "kind": "burst", "x": target["x"], "y": target["y"],
+                    "until": now + 0.25,
+                })
+                if target["hp"] <= 0:
+                    self.defeat_enemy(target, now)
+
+    def update_kidnapper(self, boss, now):
+        if now >= boss["teleport_ready"]:
+            p = self.player
+            fx, fy = p["face"]
+            boss["x"] = max(ARENA[0] + 35, min(ARENA[2] - 35, p["x"] - fx * 105))
+            boss["y"] = max(ARENA[1] + 35, min(ARENA[3] - 35, p["y"] - fy * 105))
+            boss["special_line"] = (boss["x"], boss["y"], p["x"], p["y"])
+            boss["special_until"] = now + 0.55
+            boss["special_ready"] = now + 2.4
+            boss["teleport_ready"] = now + 5
+            self.effects.append({
+                "kind": "burst", "x": boss["x"], "y": boss["y"],
+                "until": now + 0.45,
+            })
+            self.message = "THE VEIL THIEF TELEPORTS BEHIND YOU!"
+            self.message_until = now + 1
+        elif boss["special_until"] > 0 and now >= boss["special_ready"] - 1.85:
+            boss["special_until"] = 0
+            boss["special_line"] = None
+        if now >= boss["clone_ready"]:
+            clones = sum(enemy["kind"] == "kidnapper_clone" for enemy in self.enemies)
+            for offset in (-1, 1):
+                if clones >= 4:
+                    break
+                self.enemies.append({
+                    "x": max(ARENA[0] + 20, min(ARENA[2] - 20,
+                                               boss["x"] + offset * 55)),
+                    "y": max(ARENA[1] + 20, min(ARENA[3] - 20,
+                                               boss["y"] + 35)),
+                    "hp": 105,
+                    "max_hp": 105,
+                    "speed": 90,
+                    "damage": 12,
+                    "xp": 0,
+                    "radius": 17,
+                    "kind": "kidnapper_clone",
+                    "attack_ready": now + 0.7,
+                    "hurt_until": 0,
+                })
+            boss["clone_ready"] = now + 8
+            self.message = "A VEIL THIEF CLONE STEPS OUT OF THE SHADOWS!"
+            self.message_until = now + 1.4
+
+    def update_boss(self, boss, now):
+        if now >= boss["special_ready"] and boss["special_until"] <= 0:
+            p = self.player
+            dx, dy = p["x"] - boss["x"], p["y"] - boss["y"]
+            distance = max(1, math.hypot(dx, dy))
+            direction = (dx / distance, dy / distance)
+            skill_name = boss["skill"][0]
+            boss["special_line"] = (
+                boss["x"], boss["y"],
+                boss["x"] + direction[0] * (560 if skill_name in ("Groundsplit", "Ember Volley") else 320),
+                boss["y"] + direction[1] * (560 if skill_name in ("Groundsplit", "Ember Volley") else 320),
+            )
+            boss["special_until"] = now + 1.05
+            boss["special_hit"] = False
+            boss["special_ready"] = now + 4.2
+            boss["special_direction"] = direction
+            dialogue = {
+                "Groundsplit": "The earth will swallow you whole!",
+                "Frost Nova": "Kneel beneath the endless winter!",
+                "Ember Volley": "Run from the fire. It follows!",
+                "Ironbark Guard": "The whole forest strikes as one!",
+            }
+            self.message = f'{boss["boss_name"]}: "{dialogue[skill_name]}"'
+            self.message_until = now + 1.4
+            self.audio.speak(f'{boss["boss_name"]}: {dialogue[skill_name]}')
+        elif boss["special_until"] > 0 and now >= boss["special_until"]:
+            x1, y1, x2, y2 = boss["special_line"]
+            p = self.player
+            line_dx, line_dy = x2 - x1, y2 - y1
+            line_length_sq = line_dx * line_dx + line_dy * line_dy
+            projection = max(0, min(1, ((p["x"] - x1) * line_dx +
+                                        (p["y"] - y1) * line_dy) / line_length_sq))
+            closest_x, closest_y = x1 + projection * line_dx, y1 + projection * line_dy
+            skill_name = boss["skill"][0]
+            distance_to_boss = math.hypot(p["x"] - boss["x"], p["y"] - boss["y"])
+            direction = boss["special_direction"]
+            along = (p["x"] - boss["x"]) * direction[0] + (p["y"] - boss["y"]) * direction[1]
+            across = abs((p["x"] - boss["x"]) * direction[1] -
+                         (p["y"] - boss["y"]) * direction[0])
+            if skill_name == "Frost Nova":
+                in_aoe = distance_to_boss < 270
+            elif skill_name == "Ironbark Guard":
+                in_aoe = distance_to_boss < 325
+            elif skill_name == "Ember Volley":
+                in_aoe = 0 < along < 560 and across < 105 + along * 0.18
+            else:
+                in_aoe = 0 < along < 560 and across < 70
+            if not boss["special_hit"] and in_aoe:
+                damage = 25 if boss["kind"] == "minion_boss" else 50
+                p["hp"] = max(0, p["hp"] - damage)
+                p["hurt_until"] = now + 0.9
+                if skill_name == "Groundsplit":
+                    p["knockdown_until"] = now + 1.15
+                    p["x"] = max(ARENA[0] + 20, min(
+                        ARENA[2] - 20, p["x"] + direction[0] * 55
+                    ))
+                    p["y"] = max(ARENA[1] + 20, min(
+                        ARENA[3] - 20, p["y"] + direction[1] * 55
+                    ))
+                self.message = f'"{skill_name} hits!  -{damage} HP"'
+                self.message_until = now + 1.4
+                boss["special_hit"] = True
+                if p["hp"] <= 0:
+                    self.state = "gameover"
+                    self.keys.clear()
+            self.effects.append({"kind": "fissure", "line": boss["special_line"],
+                                 "until": now + 0.65, "skill": boss["skill"][0]})
+            if skill_name == "Frost Nova":
+                self.effects.append({"kind": "boss_frost", "x": boss["x"], "y": boss["y"],
+                                     "radius": 270, "until": now + 0.75})
+            elif skill_name == "Ironbark Guard":
+                self.effects.append({"kind": "boss_guard", "x": boss["x"], "y": boss["y"],
+                                     "radius": 325, "until": now + 0.75})
+            elif skill_name == "Ember Volley":
+                self.effects.append({"kind": "boss_ember", "line": boss["special_line"],
+                                     "until": now + 0.75})
+            boss["special_until"] = 0
+            boss["special_line"] = None
+
+    def shoot(self, now, dx, dy):
         p = self.player
-        p["attack_ready"] = now + 0.38
-        p["attack_until"] = now + 0.18
-        fx, fy = p["face"]
-        for enemy in self.enemies[:]:
-            ex, ey = enemy["x"] - p["x"], enemy["y"] - p["y"]
-            distance = math.hypot(ex, ey)
-            if distance <= 66 + enemy["radius"] and (
-                distance < 1 or (ex * fx + ey * fy) / distance > 0.12
-            ):
-                enemy["hp"] -= 34 + (p["level"] - 1) * 7
-                enemy["hurt_until"] = now + 0.12
-                if enemy["hp"] <= 0:
-                    self.enemies.remove(enemy)
-                    self.kills += 1
-                    p["xp"] += enemy["xp"]
-                    if random.random() < 0.16:
-                        self.pickups.append({"x": enemy["x"], "y": enemy["y"]})
-                    self.check_level_up()
+        if now < p["attack_ready"] or now < p["knockdown_until"]:
+            return
+        if self.auto_aim_enabled and self.enemies:
+            target = min(
+                self.enemies,
+                key=lambda enemy: (enemy["x"] - p["x"]) ** 2 +
+                (enemy["y"] - p["y"]) ** 2,
+            )
+            dx, dy = target["x"] - p["x"], target["y"] - p["y"]
+        length = max(1, math.hypot(dx, dy))
+        fx, fy = dx / length, dy / length
+        p["face"] = (fx, fy)
+        p["attack_ready"] = now + 0.22
+        p["shoot_until"] = now + 0.12
+        p["attack_until"] = now + 0.16
+        start_x, start_y = p["x"] + fx * 20, p["y"] + fy * 20
+        self.projectiles.append({
+            "x": start_x, "y": start_y, "vx": fx * 520, "vy": fy * 520,
+            "damage": 26 + (p["level"] - 1) * 4 + self.weapon_upgrade * 8,
+            "life": 0.75,
+        })
+        self.audio.play("shot")
+        self.effects.append({"kind": "muzzle", "x": start_x, "y": start_y,
+                             "until": now + 0.1, "direction": (fx, fy)})
+
+    def defeat_enemy(self, enemy, now):
+        if enemy not in self.enemies:
+            return
+        self.enemies.remove(enemy)
+        self.audio.play("kill")
+        self.kills += 1
+        self.player["xp"] += enemy["xp"]
+        if self.active_quest and not self.quest_complete:
+            self.quest_progress += 1
+            if self.quest_progress >= self.active_quest[2]:
+                self.quest_complete = True
+                self.quests_completed.add(self.stage_number())
+                self.coins += self.quest_reward
+                self.message = f"QUEST COMPLETE  +{self.quest_reward} COINS"
+                self.message_until = now + 2.5
+
+        if enemy["kind"] in ("boss", "minion_boss", "kidnapper"):
+            self.pickups.append({"x": enemy["x"], "y": enemy["y"], "kind": "coins",
+                                 "value": 40})
+            self.wave_left = 0
+            self.wave_pause = 0
+            self.keys.clear()
+            self.territories[self.region] = True
+            if enemy["kind"] == "kidnapper":
+                self.enemies = [
+                    remaining for remaining in self.enemies
+                    if remaining["kind"] != "kidnapper_clone"
+                ]
+                self.state = "kidnapper_reveal"
+                self.kidnapper_reveal_until = now + 6
+                self.message = "DEMON ALLY: THE KIDNAPPER IS DEFEATED!"
+                self.message_until = self.kidnapper_reveal_until
+                self.audio.speak("The kidnapper is defeated. The Demon King is free!")
+            else:
+                self.boss_corpses.append({
+                    "x": enemy["x"],
+                    "y": enemy["y"],
+                    "name": enemy["boss_name"],
+                    "skill": enemy["skill"] or self.boss_skill(),
+                })
+                self.boss_chests.append({
+                    "x": enemy["x"] + 40,
+                    "y": enemy["y"] + 24,
+                    "clicks": 0,
+                    "opened": False,
+                })
+                if enemy["kind"] == "minion_boss":
+                    clue = enemy["clue"]
+                    if clue and clue not in self.tower_clues:
+                        self.tower_clues.append(clue)
+                    if len(self.tower_clues) >= len(TOWER_MINIONS):
+                        self.rescue_route_unlocked = True
+                        self.advanced_gun_owned = True
+                        self.owned_cosmetics["GUN"].add("Warden Breaker")
+                        self.equipped_cosmetics["GUN"] = "Warden Breaker"
+                    self.clue_dialogue = f"{enemy['boss_name']}: \"{enemy['clue']}\""
+                    self.state = "minion_reveal"
+                    self.boss_dialogue_until = now + 5
+                    self.message = "A TOWER MINION HAS LEFT A CLUE"
+                    self.message_until = self.boss_dialogue_until
+                    self.audio.speak(self.clue_dialogue)
+                else:
+                    self.pending_skill = enemy["skill"]
+                    self.skill_acquire_progress = 0
+                    self.last_spoken_dialogue = None
+                    self.state = "boss_cutscene"
+                    self.boss_cutscene_until = now + 2.4
+                    self.message = f"{enemy['boss_name']} HAS FALLEN"
+                    self.message_until = self.boss_cutscene_until
+        else:
+            if random.random() < 0.16:
+                self.pickups.append({"x": enemy["x"], "y": enemy["y"], "kind": "medkit",
+                                     "value": 0})
+            if random.random() < 0.3:
+                self.pickups.append({"x": enemy["x"] + random.randint(-12, 12),
+                                     "y": enemy["y"] + random.randint(-12, 12),
+                                     "kind": "coins", "value": random.randint(1, 4)})
+        self.effects.append({"kind": "burst", "x": enemy["x"], "y": enemy["y"],
+                             "until": now + 0.3})
+        self.check_level_up()
+
+    def use_boss_ability(self, now):
+        p = self.player
+        if not self.has_boss_ability:
+            self.message = 'SCOUT: "I need to defeat a warlord to learn their technique."'
+            self.message_until = now + 1.8
+            return
+        if now < p["ability_ready"] or now < p["knockdown_until"]:
+            return
+        p["ability_ready"] = now + self.boss_ability_cooldown()
+        p["ability_until"] = now + 0.55
+        skill = self.unlocked_abilities[self.active_ability]
+        self.message = f'SCOUT: "{skill[1]}"'
+        self.message_until = now + 1.6
+        self.audio.speak(skill[1])
+        power = 1 + self.skill_upgrade * 0.45
+        area = 1 + self.skill_upgrade * 0.16
+        if skill[0] == "Groundsplit":
+            fx, fy = p["face"]
+            end_x, end_y = p["x"] + fx * 320 * area, p["y"] + fy * 320 * area
+            self.effects.append({"kind": "player_fissure",
+                                 "line": (p["x"], p["y"], end_x, end_y),
+                                 "until": now + 0.55})
+            for enemy in self.enemies[:]:
+                ex, ey = enemy["x"] - p["x"], enemy["y"] - p["y"]
+                along = ex * fx + ey * fy
+                across = abs(ex * fy - ey * fx)
+                if 0 <= along <= 320 * area and across < 68 * area + enemy["radius"]:
+                    enemy["hp"] -= int(130 * power)
+                    enemy["hurt_until"] = now + 0.2
+                    if enemy["hp"] <= 0:
+                        self.defeat_enemy(enemy, now)
+        elif skill[0] == "Frost Nova":
+            self.effects.append({"kind": "frost", "x": p["x"], "y": p["y"],
+                                 "radius": 235 * area, "until": now + 0.55})
+            for enemy in self.enemies[:]:
+                if math.hypot(enemy["x"] - p["x"], enemy["y"] - p["y"]) <= 235 * area:
+                    enemy["hp"] -= int(85 * power)
+                    enemy["slowed_until"] = now + 3
+                    enemy["hurt_until"] = now + 0.2
+                    if enemy["hp"] <= 0:
+                        self.defeat_enemy(enemy, now)
+        elif skill[0] == "Ember Volley":
+            angle = math.atan2(p["face"][1], p["face"][0])
+            for offset in (-0.42, -0.21, 0, 0.21, 0.42):
+                shot_angle = angle + offset
+                fx, fy = math.cos(shot_angle), math.sin(shot_angle)
+                self.projectiles.append({
+                    "x": p["x"] + fx * 20, "y": p["y"] + fy * 20,
+                    "vx": fx * 460, "vy": fy * 460,
+                    "damage": int(70 * power), "life": 1.1, "kind": "ember",
+                })
+        elif skill[0] == "Ironbark Guard":
+            p["shield_until"] = now + 6 + self.skill_upgrade
+            self.effects.append({"kind": "shield", "x": p["x"], "y": p["y"],
+                                 "until": p["shield_until"]})
+
+    def boss_ability_cooldown(self):
+        return 7 * 0.7 if self.boss_weapon_owned else 7
+
+    def select_next_ability(self, now):
+        if len(self.unlocked_abilities) < 2:
+            return
+        self.active_ability = (self.active_ability + 1) % len(self.unlocked_abilities)
+        name = self.unlocked_abilities[self.active_ability][0]
+        self.message = f"EQUIPPED  -  {name}"
+        self.message_until = now + 1.5
+
+    def claim_region(self, region_index):
+        region_index = max(0, min(len(REGIONS) - 1, region_index))
+        post_boss = (
+            self.pending_skill is not None
+            or self.state == "post_boss"
+            or self.map_return_state == "post_boss"
+        )
+        self.region = region_index
+        self.territories[region_index] = True
+        self.player["x"] = WIDTH / 2
+        self.player["y"] = (ARENA[1] + ARENA[3]) / 2
+        self.projectiles.clear()
+        self.canvas.delete("background")
+        self.draw_background()
+        if post_boss:
+            self.pending_skill = None
+            self.wave += 1
+            self.wave_pause = 0
+            self.show_next_quest()
+            self.message = f"TERRITORY CLAIMED  -  {REGIONS[self.region][0]}"
+            self.message_until = time.monotonic() + 2
+        else:
+            self.state = "playing"
+            self.last_tick = time.monotonic()
+            self.message = f"TRAVELED TO  -  {REGIONS[self.region][0]}"
+            self.message_until = time.monotonic() + 2.5
+
+    def update_tower_gate(self, dt):
+        dx = (("d" in self.keys or "right" in self.keys) -
+              ("a" in self.keys or "left" in self.keys))
+        dy = (("s" in self.keys or "down" in self.keys) -
+              ("w" in self.keys or "up" in self.keys))
+        if not (dx or dy):
+            return
+        length = math.hypot(dx, dy)
+        self.player["x"] += dx / length * 185 * dt
+        self.player["y"] += dy / length * 185 * dt
+        self.player["x"] = max(ARENA[0] + 20, min(ARENA[2] - 20, self.player["x"]))
+        self.player["y"] = max(ARENA[1] + 20, min(ARENA[3] - 20, self.player["y"]))
 
     def check_level_up(self):
         p = self.player
@@ -227,154 +1391,1550 @@ class BattlefieldRPG:
             self.message = "LEVEL UP!  LEVEL " + str(p["level"])
             self.message_until = time.monotonic() + 2
 
-    def rect(self, x1, y1, x2, y2, color, outline=""):
+    def rect(self, x1, y1, x2, y2, color, outline="", tag="frame"):
         self.canvas.create_rectangle(
-            x1, y1, x2, y2, fill=color, outline=outline, width=1
+            x1, y1, x2, y2, fill=color, outline=outline, width=1, tags=tag
         )
 
     def draw_background(self):
         c = self.canvas
-        c.create_rectangle(0, 0, WIDTH, HEIGHT, fill="#171d20", outline="")
-        self.rect(*ARENA, "#39453b", "#7d8065")
+        _, ground, border, grid = REGIONS[self.region]
+        accent = REGION_ACCENTS[self.region]
+        c.create_rectangle(0, 0, WIDTH, HEIGHT, fill="#151a20",
+                           outline="", tags="background")
+        c.create_rectangle(
+            ARENA[0] - 7, ARENA[1] - 7, ARENA[2] + 7, ARENA[3] + 7,
+            fill="#20282a", outline=border, width=3, tags="background"
+        )
+        self.rect(*ARENA, ground, border, tag="background")
+        c.create_rectangle(
+            ARENA[0] + 5, ARENA[1] + 5, ARENA[2] - 5, ARENA[3] - 5,
+            outline=grid, width=1, tag="background"
+        )
         for x in range(ARENA[0] + 12, ARENA[2], 48):
-            c.create_line(x, ARENA[1], x, ARENA[3], fill="#414b3e")
+            c.create_line(x, ARENA[1], x, ARENA[3], fill=grid, width=1,
+                          tags="background")
         for y in range(ARENA[1] + 12, ARENA[3], 48):
-            c.create_line(ARENA[0], y, ARENA[2], y, fill="#414b3e")
+            c.create_line(ARENA[0], y, ARENA[2], y, fill=grid, width=1,
+                          tags="background")
+        terrain_rng = random.Random(401 + self.region * 37)
+        for _ in range(13):
+            x = terrain_rng.randint(ARENA[0] + 35, ARENA[2] - 35)
+            y = terrain_rng.randint(ARENA[1] + 32, ARENA[3] - 32)
+            size = terrain_rng.randint(9, 22)
+            if self.region == 1:
+                c.create_polygon(
+                    x, y - size, x + size * 0.45, y - size * 0.15,
+                    x + size * 0.2, y + size, x - size * 0.35, y + size * 0.25,
+                    fill="#6b9aa5", outline="#9bcbd2", width=1,
+                    tags="background"
+                )
+                c.create_line(x, y - size * 0.6, x - size * 0.1, y + size * 0.3,
+                              fill="#c6eef0", width=1, tags="background")
+            elif self.region == 2:
+                c.create_oval(
+                    x - size, y - size * 0.48, x + size, y + size * 0.48,
+                    fill="#76513e", outline="#b57a4d", width=1,
+                    tags="background"
+                )
+                c.create_line(x - size * 0.55, y, x + size * 0.3, y - size * 0.12,
+                              fill="#d08a50", width=1, tags="background")
+            elif self.region == 3:
+                c.create_line(x, y + size, x, y - size,
+                              fill="#40583a", width=max(3, size // 3),
+                              tags="background")
+                c.create_oval(x - size, y - size * 0.9,
+                              x + size, y + size * 0.15,
+                              fill="#5f844e", outline="#87a961",
+                              width=1, tags="background")
+                c.create_oval(x - size * 0.55, y - size * 0.62,
+                              x + size * 0.25, y - size * 0.05,
+                              fill="#83a85e", outline="", tags="background")
+            else:
+                c.create_line(
+                    x - size, y + size * 0.45,
+                    x - size * 0.15, y - size * 0.35,
+                    x + size * 0.35, y - size * 0.55,
+                    fill="#6d6251", width=2, tags="background"
+                )
+                c.create_line(x - size * 0.12, y - size * 0.26,
+                              x + size * 0.75, y + size * 0.28,
+                              fill=accent, width=1, tags="background")
         for x, y, kind, size in self.decor:
             if kind == "crater":
                 c.create_oval(x - size, y - size * 0.45, x + size, y + size * 0.45,
-                              fill="#303a32", outline="#485044")
+                              fill="#303a32", outline=grid, tags="background")
             elif kind == "stone":
                 c.create_oval(x - size / 2, y - size / 3, x + size / 2, y + size / 3,
-                              fill="#626356", outline="")
+                              fill=border, outline=ground, tags="background")
             else:
-                c.create_line(x, y, x + size, y - size // 2, fill="#89906b", width=2)
-        self.draw_barricade(ARENA[0] + 105, ARENA[1] + 55, "#71807a")
-        self.draw_barricade(ARENA[2] - 170, ARENA[3] - 68, "#806d56")
+                c.create_line(x, y, x + size, y - size // 2, fill=accent, width=2,
+                              tags="background")
+        self.draw_barricade(ARENA[0] + 105, ARENA[1] + 55, accent, "background")
+        self.draw_barricade(ARENA[2] - 170, ARENA[3] - 68, border, "background")
+        for x, y in (
+            (ARENA[0] + 22, ARENA[1] + 22),
+            (ARENA[2] - 22, ARENA[1] + 22),
+            (ARENA[0] + 22, ARENA[3] - 22),
+            (ARENA[2] - 22, ARENA[3] - 22),
+        ):
+            c.create_oval(x - 7, y - 7, x + 7, y + 7,
+                          fill=accent, outline="#fff1d2", width=1,
+                          tags="background")
+            c.create_oval(x - 3, y - 3, x + 3, y + 3,
+                          fill="#fff1d2", outline="", tags="background")
         self.canvas.create_line(ARENA[0] + 36, ARENA[1] + 28,
-                                ARENA[0] + 36, ARENA[1] + 66, fill="#c6c1a6", width=2)
+                                ARENA[0] + 36, ARENA[1] + 66, fill="#c6c1a6", width=2,
+                                tags="background")
         self.canvas.create_polygon(
             ARENA[0] + 38, ARENA[1] + 29, ARENA[0] + 64, ARENA[1] + 36,
-            ARENA[0] + 38, ARENA[1] + 44, fill="#708ea0", outline=""
+            ARENA[0] + 38, ARENA[1] + 44, fill=accent, outline="", tags="background"
         )
         self.canvas.create_line(ARENA[2] - 38, ARENA[3] - 68,
-                                ARENA[2] - 38, ARENA[3] - 30, fill="#c6c1a6", width=2)
+                                ARENA[2] - 38, ARENA[3] - 30, fill="#c6c1a6", width=2,
+                                tags="background")
         self.canvas.create_polygon(
             ARENA[2] - 36, ARENA[3] - 67, ARENA[2] - 62, ARENA[3] - 60,
-            ARENA[2] - 36, ARENA[3] - 52, fill="#a36a57", outline=""
+            ARENA[2] - 36, ARENA[3] - 52, fill=accent, outline="", tags="background"
         )
 
-    def draw_barricade(self, x, y, color):
-        for i in range(4):
-            self.rect(x + i * 18, y + (i % 2) * 5, x + 17 + i * 18, y + 9 + (i % 2) * 5,
-                      color, "#252c28")
-        self.rect(x + 12, y + 12, x + 67, y + 18, "#4b5148", "#252c28")
+    def draw_barricade(self, x, y, color, tag="frame"):
+        c = self.canvas
+        c.create_oval(x - 3, y + 4, x + 80, y + 24, fill="#293129",
+                      outline="", tags=tag)
+        for row in range(2):
+            for i in range(4):
+                bx = x + i * 18 - row * 8
+                by = y + row * 8
+                c.create_oval(bx, by, bx + 18, by + 13, fill=color,
+                              outline="#33372f", width=1, tags=tag)
+                c.create_arc(bx + 3, by + 2, bx + 13, by + 9, start=25,
+                             extent=115, style=tk.ARC, outline="#a9a58b",
+                             width=1, tags=tag)
 
     def draw_bar(self, x, y, width, ratio, color, height=6):
         self.rect(x, y, x + width, y + height, "#252a29")
         if ratio > 0:
             self.rect(x, y, x + width * max(0, min(1, ratio)), y + height, color)
 
-    def draw_entity(self, x, y, radius, body, outline, direction=(0, 0)):
+    def draw_entity(self, x, y, radius, body, outline, direction=(1, 0),
+                    kind="raider", cosmetic_override=None, moving=False):
         c = self.canvas
-        c.create_oval(x - radius, y - radius + 4, x + radius, y + radius + 4,
-                      fill="#252b27", outline="")
-        c.create_oval(x - radius, y - radius, x + radius, y + radius,
-                      fill=body, outline=outline, width=2)
-        c.create_oval(x - radius * 0.52, y - radius * 0.54,
-                      x - radius * 0.12, y - radius * 0.12, fill="#ffffff", outline="")
-        if direction != (0, 0):
-            c.create_line(x, y, x + direction[0] * radius * 0.65,
-                          y + direction[1] * radius * 0.65, fill="#f3e7c9", width=2)
+        appearance = cosmetic_override or self.equipped_cosmetics
+        phase = time.monotonic() * 10
+        stride = math.sin(phase) if moving else 0
+        bob = (abs(math.sin(phase)) * radius * 0.045 if moving else
+               math.sin(phase * 0.2) * radius * 0.012)
+        fx, fy = direction
+        length = max(1, math.hypot(fx, fy))
+        fx, fy = fx / length, fy / length
+        sx, sy = -fy, fx
+
+        def point(forward, sideways):
+            return (x + fx * radius * forward + sx * radius * sideways,
+                    y + fy * radius * forward + sy * radius * sideways + bob)
+
+        body_color = body
+        if kind == "scout":
+            body_color = next(
+                item[2] for item in COSMETIC_ITEMS["OUTFIT"]
+                if item[0] == appearance["OUTFIT"]
+            )
+
+        c.create_oval(x - radius * 0.82, y - radius * 0.48,
+                      x + radius * 0.82, y + radius * 0.78,
+                      fill="#252b27", outline="", tags="frame")
+
+        hip = point(-0.2, 0)
+        for side in (-0.23, 0.23):
+            swing = stride * (1 if side < 0 else -1) * 0.23
+            knee = point(-0.4 + swing, side)
+            boot = point(-0.62 + swing * 1.6, side * 1.2)
+            c.create_line(*hip, *knee, fill="#303530",
+                          width=max(3, int(radius * 0.3)), tags="frame")
+            c.create_line(*knee, *boot, fill="#282d29",
+                          width=max(3, int(radius * 0.25)), tags="frame")
+
+        for side in (-0.45, 0.45):
+            shoulder = point(0.28, side)
+            arm_swing = stride * (1 if side < 0 else -1) * 0.18
+            elbow = point(0.02 + arm_swing, side * 1.1)
+            hand = point(-0.2 + arm_swing * 1.5, side * 1.22)
+            c.create_line(*shoulder, *elbow, *hand, fill=body_color,
+                          width=max(3, int(radius * 0.18)), tags="frame")
+            c.create_oval(hand[0] - radius * 0.1, hand[1] - radius * 0.1,
+                          hand[0] + radius * 0.1, hand[1] + radius * 0.1,
+                          fill="#c69a77", outline=outline, width=1, tags="frame")
+
+        left_shoulder = point(0.35, 0.42)
+        right_shoulder = point(0.35, -0.42)
+        left_hip = point(-0.42, 0.3)
+        right_hip = point(-0.42, -0.3)
+        c.create_polygon(*left_shoulder, *right_shoulder, *right_hip, *left_hip,
+                         fill=body_color, outline=outline, width=2, tags="frame")
+        c.create_polygon(*point(0.23, 0.22), *point(0.23, -0.22),
+                         *point(-0.32, -0.18), *point(-0.32, 0.18),
+                         fill="#46514a", outline="#303b36", width=1, tags="frame")
+        c.create_line(*point(0.12, 0), *point(-0.22, 0),
+                      fill="#a5a58b", width=max(1, int(radius * 0.1)), tags="frame")
+
+        for side in (-0.45, 0.45):
+            shoulder = point(0.28, side)
+            c.create_oval(shoulder[0] - radius * 0.19, shoulder[1] - radius * 0.19,
+                          shoulder[0] + radius * 0.19, shoulder[1] + radius * 0.19,
+                          fill=body_color, outline=outline, width=1, tags="frame")
+
+        if kind in ("brute", "boss", "minion_boss", "kidnapper"):
+            pack = point(-0.42, 0)
+            c.create_oval(pack[0] - radius * 0.42, pack[1] - radius * 0.37,
+                          pack[0] + radius * 0.42, pack[1] + radius * 0.37,
+                          fill="#473a43" if kind == "brute" else
+                          "#432f40" if kind == "boss" else "#302439",
+                          outline="#302e32", width=2, tags="frame")
+
+        head = point(0.55, 0)
+        head_radius = radius * 0.29
+        c.create_oval(head[0] - head_radius, head[1] - head_radius,
+                      head[0] + head_radius, head[1] + head_radius,
+                      fill="#c69a77", outline="#39332c", width=1, tags="frame")
+        if kind == "scout":
+            hair = appearance["HAIR"]
+            hair_color = next(
+                item[2] for item in COSMETIC_ITEMS["HAIR"] if item[0] == hair
+            )
+            c.create_oval(
+                head[0] - head_radius * 0.95,
+                head[1] - head_radius * 0.95,
+                head[0] + head_radius * 0.95,
+                head[1] - head_radius * 0.12,
+                fill=hair_color, outline="#39332c", width=1, tags="frame"
+            )
+            if hair == "Wild Tuft":
+                c.create_polygon(
+                    head[0] - head_radius * 0.8, head[1] - head_radius * 0.5,
+                    head[0] - head_radius * 0.5, head[1] - head_radius * 1.5,
+                    head[0] - head_radius * 0.05, head[1] - head_radius * 0.75,
+                    head[0] + head_radius * 0.45, head[1] - head_radius * 1.35,
+                    head[0] + head_radius * 0.85, head[1] - head_radius * 0.2,
+                    fill=hair_color, outline="#39332c", width=1, tags="frame"
+                )
+            mask = appearance["MASK"]
+            mask_color = next(
+                item[2] for item in COSMETIC_ITEMS["MASK"] if item[0] == mask
+            )
+            if mask_color:
+                c.create_rectangle(
+                    head[0] - head_radius * 0.78,
+                    head[1] + head_radius * 0.05,
+                    head[0] + head_radius * 0.78,
+                    head[1] + head_radius * 0.55,
+                    fill=mask_color, outline="#39332c", width=1, tags="frame"
+                )
+            else:
+                for side in (-0.14, 0.14):
+                    eye = point(0.69, side)
+                    c.create_oval(
+                        eye[0] - radius * 0.045, eye[1] - radius * 0.065,
+                        eye[0] + radius * 0.045, eye[1] + radius * 0.065,
+                        fill="#f3ead4", outline="", tags="frame"
+                    )
+                    pupil = point(0.72, side)
+                    c.create_oval(
+                        pupil[0] - radius * 0.02, pupil[1] - radius * 0.035,
+                        pupil[0] + radius * 0.02, pupil[1] + radius * 0.035,
+                        fill="#252b27", outline="", tags="frame"
+                    )
+        else:
+            helmet = point(0.66, 0)
+            helmet_radius = radius * (
+                0.42 if kind in ("boss", "minion_boss", "kidnapper") else 0.3
+            )
+            c.create_oval(helmet[0] - helmet_radius, helmet[1] - helmet_radius,
+                          helmet[0] + helmet_radius, helmet[1] + helmet_radius,
+                          fill="#a04e53" if kind in
+                          ("boss", "minion_boss", "kidnapper") else "#6c6d57",
+                          outline="#353b32", width=1, tags="frame")
+            c.create_arc(helmet[0] - helmet_radius + 1, helmet[1] - helmet_radius + 1,
+                         helmet[0] + helmet_radius - 1, helmet[1] + helmet_radius - 1,
+                         start=35, extent=115, style=tk.ARC, outline="#b4b28e",
+                         width=1, tags="frame")
+
+        weapon_start = point(0.12, -0.33)
+        weapon_name = appearance["GUN"] if kind == "scout" else ""
+        weapon_length = 1.18 if weapon_name == "Longshot" else 0.94
+        weapon_width = 1.5 if weapon_name == "Scattergun" else 1
+        weapon_color = next(
+            (item[2] for item in COSMETIC_ITEMS["GUN"] if item[0] == weapon_name),
+            "#858678",
+        )
+        weapon_end = point(weapon_length, -0.33)
+        c.create_line(*point(-0.05, -0.33), *weapon_start,
+                      fill="#292c29", width=max(3, int(radius * 0.22 * weapon_width)),
+                      tags="frame")
+        c.create_line(*weapon_start, *weapon_end, fill="#262b2a",
+                      width=max(3, int(radius * 0.2 * weapon_width)), tags="frame")
+        c.create_line(*point(0.45, -0.33), *weapon_end,
+                      fill=weapon_color, width=max(1, int(radius * 0.07)),
+                      tags="frame")
+        if kind == "scout":
+            glove_color = next(
+                item[2] for item in COSMETIC_ITEMS["GLOVES"]
+                if item[0] == appearance["GLOVES"]
+            )
+            for side in (-0.57, 0.57):
+                hand = point(0.15, side)
+                c.create_oval(
+                    hand[0] - radius * 0.12, hand[1] - radius * 0.12,
+                    hand[0] + radius * 0.12, hand[1] + radius * 0.12,
+                    fill=glove_color, outline="#292c29", width=1, tags="frame"
+                )
+
+    def draw_boss_corpse(self, corpse):
+        x, y = corpse["x"], corpse["y"]
+        c = self.canvas
+        c.create_oval(x - 48, y + 9, x + 44, y + 26,
+                      fill="#252b27", outline="", tags="frame")
+        c.create_polygon(x - 34, y - 5, x + 18, y - 10,
+                         x + 30, y + 10, x - 24, y + 15,
+                         fill="#573943", outline="#302e32", width=2,
+                         tags="frame")
+        c.create_line(x - 20, y + 8, x - 44, y + 20,
+                      fill="#42373a", width=8, tags="frame")
+        c.create_line(x - 15, y + 9, x - 35, y + 25,
+                      fill="#42373a", width=7, tags="frame")
+        c.create_oval(x + 16, y - 15, x + 40, y + 9,
+                      fill="#c69a77", outline="#302e32", width=2,
+                      tags="frame")
+        c.create_oval(x + 20, y - 20, x + 45, y + 3,
+                      fill="#70434a", outline="#302e32", width=2,
+                      tags="frame")
+        c.create_line(x - 5, y - 7, x + 34, y + 18,
+                      fill="#262b2a", width=5, tags="frame")
+        c.create_line(x + 23, y + 11, x + 49, y + 27,
+                      fill="#858678", width=2, tags="frame")
+
+    def draw_boss_chest(self, chest):
+        x, y = chest["x"], chest["y"]
+        c = self.canvas
+        if chest["opened"]:
+            c.create_rectangle(x - 19, y - 8, x + 19, y + 7,
+                               fill="#514832", outline="#c8a957",
+                               width=2, tags="frame")
+            c.create_line(x - 18, y - 8, x - 14, y - 20,
+                          x + 14, y - 20, x + 18, y - 8,
+                          fill="#c8a957", width=3, tags="frame")
+            return
+        c.create_rectangle(x - 20, y - 10, x + 20, y + 10,
+                           fill="#704c32", outline="#f0c45a",
+                           width=2, tags="frame")
+        c.create_rectangle(x - 20, y - 4, x + 20, y + 1,
+                           fill="#c28c3d", outline="#f0c45a",
+                           width=1, tags="frame")
+        c.create_oval(x - 3, y - 3, x + 3, y + 4,
+                      fill="#f3e5a5", outline="", tags="frame")
+        c.create_text(x, y + 24, text=f"CLICK CHEST {chest['clicks']}/5",
+                      fill="#f0d99f", font=("Segoe UI", 7, "bold"),
+                      tags="frame")
+
+    def draw_skill_dialogue(self):
+        if self.state not in ("boss_cutscene", "boss_dialogue", "boss_skill"):
+            return
+        c = self.canvas
+        if self.state == "boss_cutscene":
+            corpse = self.boss_corpses[-1] if self.boss_corpses else None
+            if corpse:
+                elapsed = 2.4 - max(0, self.boss_cutscene_until - time.monotonic())
+                radius = 45 + int(elapsed * 75)
+                c.create_oval(
+                    corpse["x"] - radius, corpse["y"] - radius,
+                    corpse["x"] + radius, corpse["y"] + radius,
+                    outline="#d9a453", width=4, tags="frame"
+                )
+            c.create_rectangle(0, 0, WIDTH, 85, fill="#080b10",
+                               stipple="gray50", outline="", tags="frame")
+            c.create_rectangle(0, HEIGHT - 85, WIDTH, HEIGHT,
+                               fill="#080b10", stipple="gray50",
+                               outline="", tags="frame")
+            c.create_text(WIDTH / 2, 42,
+                          text=f"{self.boss_corpses[-1]['name'].upper()} HAS FALLEN",
+                          fill="#f1d59d", font=("Segoe UI", 23, "bold"),
+                          tags="frame")
+            c.create_text(WIDTH / 2, HEIGHT - 42,
+                          text="THE BATTLEFIELD FALLS SILENT...",
+                          fill="#e3ddd0", font=("Segoe UI", 12, "bold"),
+                          tags="frame")
+            return
+
+        corpse = self.boss_corpses[-1] if self.boss_corpses else None
+        if corpse is None:
+            return
+        if self.state == "boss_dialogue":
+            elapsed = 3.2 - max(0, self.boss_dialogue_until - time.monotonic())
+            text = (BOSS_DEFEAT_DIALOGUE if elapsed < 1.6 else
+                    corpse["skill"][2])
+            prompt = ""
+        else:
+            text = corpse["skill"][2]
+            head_x, head_y = corpse["x"] + 22, corpse["y"] - 8
+            distance = math.hypot(
+                self.player["x"] - head_x, self.player["y"] - head_y
+            )
+            if distance <= 82 and "e" in self.keys:
+                shoulder = (self.player["x"] + 3, self.player["y"] - 12)
+                hand = (head_x, head_y - 4)
+                c.create_line(*shoulder, *hand, fill="#d2a27d",
+                              width=7, tags="frame")
+                c.create_oval(hand[0] - 6, hand[1] - 6,
+                              hand[0] + 6, hand[1] + 6,
+                              fill="#e7bd91", outline="#fff1d2",
+                              width=2, tags="frame")
+                phase = time.monotonic() * 8
+                for index in range(8):
+                    angle = phase + index * math.tau / 8
+                    inner = 15 + math.sin(phase * 2 + index) * 3
+                    outer = 42 + math.cos(phase + index) * 5
+                    c.create_line(
+                        head_x + math.cos(angle) * inner,
+                        head_y + math.sin(angle) * inner,
+                        head_x + math.cos(angle) * outer,
+                        head_y + math.sin(angle) * outer,
+                        fill="#e5c874", width=2, tags="frame"
+                    )
+                prompt = "HOLD E  -  CHANNELING THE BOSS'S POWER"
+            elif distance <= 82:
+                prompt = "HOLD E TO RECEIVE THE BOSS'S SKILL"
+            else:
+                prompt = "MOVE CLOSE TO THE BOSS'S HEAD"
+
+        c.create_rectangle(190, 96, 770, 160, fill="#101718",
+                           outline="#d4bd91", width=2, tags="frame")
+        c.create_text(WIDTH / 2, 113, text=corpse["name"],
+                      fill="#e5c874", font=("Segoe UI", 10, "bold"),
+                      tags="frame")
+        c.create_text(WIDTH / 2, 139, text=f'"{text}"', width=550,
+                      fill="#f0d7c5", font=("Segoe UI", 11, "bold"),
+                      tags="frame")
+        if prompt:
+            if self.state == "boss_skill" and "e" in self.keys:
+                c.create_rectangle(0, 0, WIDTH, 70, fill="#080b10",
+                                   stipple="gray50", outline="", tags="frame")
+                c.create_rectangle(0, HEIGHT - 48, WIDTH, HEIGHT,
+                                   fill="#080b10", stipple="gray50",
+                                   outline="", tags="frame")
+                c.create_text(WIDTH / 2, 35,
+                              text="THE POWER PASSES BETWEEN WARRIORS",
+                              fill="#f1d59d", font=("Segoe UI", 13, "bold"),
+                              tags="frame")
+            c.create_text(WIDTH / 2, 482, text=prompt,
+                          fill="#fff1d2", font=("Segoe UI", 12, "bold"),
+                          tags="frame")
+            if self.state == "boss_skill":
+                self.draw_bar(350, 500, 260, self.skill_acquire_progress / 2.5,
+                              "#e5c874", 9)
 
     def draw_game(self, now):
-        self.draw_background()
         p = self.player
         self.rect(0, 0, WIDTH, 80, "#20292b")
         self.canvas.create_text(24, 19, text="ASHEN FRONT", anchor="w",
-                                fill="#e6d9ba", font=("Segoe UI", 13, "bold"))
-        self.canvas.create_text(24, 48, text=f"LV {p['level']}  |  WAVE {self.wave}",
-                                anchor="w", fill="#c6c5b4", font=("Segoe UI", 10, "bold"))
+                                fill="#e6d9ba", font=("Segoe UI", 13, "bold"), tags="frame")
+        self.canvas.create_text(24, 48,
+                                text=f"LV {p['level']}  |  FLOOR {min(100, self.stage_number())}/100  |  WAVE {(self.wave - 1) % 4 + 1}/4",
+                                anchor="w", fill="#c6c5b4", font=("Segoe UI", 10, "bold"),
+                                tags="frame")
         self.draw_bar(180, 20, 200, p["hp"] / p["max_hp"], "#c4584e", 13)
         self.canvas.create_text(180, 43, text=f"HP  {p['hp']} / {p['max_hp']}",
-                                anchor="w", fill="#e7d8c8", font=("Segoe UI", 9))
+                                anchor="w", fill="#e7d8c8", font=("Segoe UI", 9), tags="frame")
         self.draw_bar(180, 57, 200, p["xp"] / p["next_xp"], "#d2a64e", 7)
         self.canvas.create_text(408, 23, text=f"XP  {p['xp']} / {p['next_xp']}",
-                                anchor="w", fill="#d8c58f", font=("Segoe UI", 9))
+                                anchor="w", fill="#d8c58f", font=("Segoe UI", 9), tags="frame")
         self.canvas.create_text(WIDTH - 24, 24, text=f"DEFEATED  {self.kills}",
-                                anchor="e", fill="#c6c5b4", font=("Segoe UI", 10, "bold"))
+                                anchor="e", fill="#c6c5b4", font=("Segoe UI", 10, "bold"),
+                                tags="frame")
+        self.canvas.create_text(WIDTH - 24, 51, text=f"COINS  {self.coins}",
+                                anchor="e", fill="#ebc86a",
+                                font=("Segoe UI", 10, "bold"), tags="frame")
+        if self.state in ("playing", "post_boss"):
+            auto_aim_label = "AUTO AIM: ON" if self.auto_aim_enabled else "AUTO AIM: OFF"
+            auto_aim_color = "#53634d" if self.auto_aim_enabled else "#343b38"
+            self.canvas.create_rectangle(812, 61, 936, 87, fill=auto_aim_color,
+                                         outline="#d4bd91", width=1, tags="frame")
+            self.canvas.create_text(874, 74, text=auto_aim_label,
+                                    fill="#fff1d2", font=("Segoe UI", 8, "bold"),
+                                    tags="frame")
+        self.canvas.create_text(WIDTH / 2, 68,
+                                text=f"REGION  {REGIONS[self.region][0]}",
+                                fill="#d0d4c2", font=("Segoe UI", 8, "bold"), tags="frame")
+        if not self.has_boss_ability:
+            ability_text = "1  BOSS SKILL  -  DEFEAT A BOSS"
+        else:
+            ability_name = self.unlocked_abilities[self.active_ability][0]
+            ability_text = f"1  {ability_name}  READY" if now >= p["ability_ready"] else (
+                f"1  {ability_name}  {max(0, p['ability_ready'] - now):.1f}s"
+            )
+            if self.boss_weapon_owned:
+                ability_text += "  |  BOSS WEAPON -30%"
+        self.canvas.create_text(WIDTH / 2, HEIGHT - 40, text=ability_text,
+                                fill="#e1c77d", font=("Segoe UI", 9, "bold"), tags="frame")
+        if len(self.unlocked_abilities) > 1:
+            self.canvas.create_text(WIDTH / 2, HEIGHT - 56,
+                                    text="2  CYCLE BOSS SKILLS",
+                                    fill="#b9c1ac", font=("Segoe UI", 8, "bold"),
+                                    tags="frame")
 
         for pickup in self.pickups:
             x, y = pickup["x"], pickup["y"]
-            self.canvas.create_oval(x - 9, y - 9, x + 9, y + 9,
-                                    fill="#83b581", outline="#d9e3b2", width=2)
-            self.canvas.create_text(x, y, text="+", fill="#f3f5da",
-                                    font=("Segoe UI", 12, "bold"))
+            if pickup["kind"] == "medkit":
+                self.canvas.create_oval(x - 9, y - 9, x + 9, y + 9,
+                                        fill="#83b581", outline="#d9e3b2", width=2,
+                                        tags="frame")
+                self.canvas.create_text(x, y, text="+", fill="#f3f5da",
+                                        font=("Segoe UI", 12, "bold"), tags="frame")
+            else:
+                self.canvas.create_oval(x - 9, y - 9, x + 9, y + 9,
+                                        fill="#d8ae48", outline="#ffeb9e", width=2,
+                                        tags="frame")
+                self.canvas.create_text(x, y, text="$", fill="#fff3ba",
+                                        font=("Segoe UI", 9, "bold"), tags="frame")
+
+        for corpse in self.boss_corpses:
+            self.draw_boss_corpse(corpse)
+        for chest in self.boss_chests:
+            self.draw_boss_chest(chest)
+
+        if self.rescue_battle:
+            ally_x = max(ARENA[0] + 30, p["x"] - 48)
+            self.draw_demon_king(ally_x, p["y"] + 4, scale=0.38, wings=False)
+            self.canvas.create_text(ally_x, p["y"] - 44, text="DEMON KING",
+                                    fill="#e5c874",
+                                    font=("Segoe UI", 7, "bold"), tags="frame")
 
         for enemy in self.enemies:
-            color = {"raider": "#bd6555", "ranger": "#ce9c51", "brute": "#875b72"}[enemy["kind"]]
+            color = {
+                "raider": "#bd6555", "ranger": "#ce9c51", "brute": "#875b72",
+                "boss": "#a44951", "minion_boss": "#75517c",
+                "kidnapper": "#3e263f", "kidnapper_clone": "#8f739b",
+            }[enemy["kind"]]
             if now < enemy["hurt_until"]:
                 color = "#f4e3c9"
-            self.draw_entity(enemy["x"], enemy["y"], enemy["radius"], color, "#352c2b")
-            self.draw_bar(enemy["x"] - 16, enemy["y"] - enemy["radius"] - 11, 32,
-                          enemy["hp"] / enemy["max_hp"], "#d57462", 4)
+            facing = (p["x"] - enemy["x"], p["y"] - enemy["y"])
+            facing_length = max(1, math.hypot(*facing))
+            facing = (facing[0] / facing_length, facing[1] / facing_length)
+            self.draw_entity(
+                enemy["x"], enemy["y"], enemy["radius"], color, "#352c2b",
+                facing, enemy["kind"],
+                moving=(math.hypot(p["x"] - enemy["x"], p["y"] - enemy["y"])
+                        > enemy["radius"] + 20)
+            )
+            if enemy["kind"] in ("boss", "minion_boss", "kidnapper"):
+                boss_bar_x = WIDTH / 2 - 150
+                self.draw_bar(boss_bar_x, 104, 300, enemy["hp"] / enemy["max_hp"],
+                              "#c3424a", 10)
+                self.canvas.create_text(WIDTH / 2, 91,
+                                        text=f'{enemy["boss_name"]}  {enemy["hp"]} HP',
+                                        fill="#f0d7c5", font=("Segoe UI", 10, "bold"),
+                                        tags="frame")
+                if enemy["special_until"] > 0 and enemy["special_line"]:
+                    x1, y1, x2, y2 = enemy["special_line"]
+                    skill_name = (enemy.get("skill") or ("",))[0]
+                    if skill_name in ("Frost Nova", "Ironbark Guard"):
+                        radius = 270 if skill_name == "Frost Nova" else 325
+                        color = "#8ee5f0" if skill_name == "Frost Nova" else "#a5d46d"
+                        self.canvas.create_oval(
+                            enemy["x"] - radius, enemy["y"] - radius,
+                            enemy["x"] + radius, enemy["y"] + radius,
+                            outline=color, width=3, dash=(8, 6), tags="frame"
+                        )
+                    self.canvas.create_line(x1, y1, x2, y2, fill="#e9b64d",
+                                            width=13, dash=(3, 5), tags="frame")
+                    self.canvas.create_line(x1, y1, x2, y2, fill="#ffe59a",
+                                            width=3, dash=(8, 5), tags="frame")
+            else:
+                self.draw_bar(enemy["x"] - 16, enemy["y"] - enemy["radius"] - 11, 32,
+                              enemy["hp"] / enemy["max_hp"], "#d57462", 4)
 
         facing = p["face"]
-        self.draw_entity(p["x"], p["y"], 15, "#72a2ad", "#d5d9c0", facing)
+        if now < p["knockdown_until"]:
+            self.draw_knockdown(p["x"], p["y"])
+        else:
+            self.draw_entity(
+                p["x"], p["y"], 15, "#72a2ad", "#d5d9c0", facing, "scout",
+                moving=any(key in self.keys for key in
+                           ("w", "a", "s", "d", "up", "down", "left", "right"))
+            )
+        for projectile in self.projectiles:
+            self.canvas.create_oval(projectile["x"] - 4, projectile["y"] - 4,
+                                    projectile["x"] + 4, projectile["y"] + 4,
+                                    fill="#ffe28a", outline="#fff7d1", tags="frame")
+        for effect in self.effects:
+            if effect["kind"] in ("fissure", "player_fissure"):
+                x1, y1, x2, y2 = effect["line"]
+                color = "#e9c65e" if effect["kind"] == "fissure" else "#8ed0c1"
+                if effect.get("skill") == "Frost Nova":
+                    color = "#8ee5f0"
+                elif effect.get("skill") == "Ember Volley":
+                    color = "#ff824a"
+                elif effect.get("skill") == "Ironbark Guard":
+                    color = "#a5d46d"
+                self.canvas.create_line(x1, y1, x2, y2, fill=color, width=8,
+                                        tags="frame")
+                self.canvas.create_line(x1, y1, x2, y2, fill="#f4e8bd", width=2,
+                                        dash=(4, 3), tags="frame")
+            elif effect["kind"] == "muzzle":
+                fx, fy = effect["direction"]
+                self.canvas.create_oval(effect["x"] - 7, effect["y"] - 7,
+                                        effect["x"] + 7, effect["y"] + 7,
+                                        fill="#ffe28a", outline="#fff6d0", tags="frame")
+                self.canvas.create_line(effect["x"], effect["y"],
+                                        effect["x"] + fx * 15, effect["y"] + fy * 15,
+                                        fill="#fff6d0", width=3, tags="frame")
+            elif effect["kind"] == "burst":
+                self.canvas.create_oval(effect["x"] - 12, effect["y"] - 12,
+                                        effect["x"] + 12, effect["y"] + 12,
+                                        outline="#ffdb8d", width=2, tags="frame")
+            elif effect["kind"] == "frost":
+                radius = effect.get("radius", 235)
+                self.canvas.create_oval(effect["x"] - radius, effect["y"] - radius,
+                                        effect["x"] + radius, effect["y"] + radius,
+                                        outline="#a4e8f2", width=5, tags="frame")
+                inner = radius * 0.83
+                self.canvas.create_oval(effect["x"] - inner, effect["y"] - inner,
+                                        effect["x"] + inner, effect["y"] + inner,
+                                        outline="#daf8ff", width=2, dash=(5, 4),
+                                        tags="frame")
+            elif effect["kind"] == "shield":
+                self.canvas.create_oval(effect["x"] - 24, effect["y"] - 24,
+                                        effect["x"] + 24, effect["y"] + 24,
+                                        outline="#95c98b", width=4, tags="frame")
+            elif effect["kind"] == "boss_frost":
+                self.canvas.create_oval(effect["x"] - effect["radius"],
+                                        effect["y"] - effect["radius"],
+                                        effect["x"] + effect["radius"],
+                                        effect["y"] + effect["radius"],
+                                        outline="#8ee5f0", width=9, tags="frame")
+            elif effect["kind"] == "boss_guard":
+                self.canvas.create_oval(effect["x"] - effect["radius"],
+                                        effect["y"] - effect["radius"],
+                                        effect["x"] + effect["radius"],
+                                        effect["y"] + effect["radius"],
+                                        outline="#a5d46d", width=9, tags="frame")
+            elif effect["kind"] == "boss_ember":
+                x1, y1, x2, y2 = effect["line"]
+                self.canvas.create_line(x1, y1, x2, y2, fill="#ff824a",
+                                        width=20, tags="frame")
+                self.canvas.create_line(x1, y1, x2, y2, fill="#ffdc8a",
+                                        width=4, dash=(6, 4), tags="frame")
+        if self.rescue_battle and self.state in ("playing", "boss_warning"):
+            self.draw_demon_king(p["x"] - 58, p["y"] + 5, scale=0.36)
         if now < p["hurt_until"] and int(now * 18) % 2 == 0:
             self.canvas.create_oval(p["x"] - 20, p["y"] - 20, p["x"] + 20, p["y"] + 20,
-                                    outline="#f2d5a5", width=2)
-        if now < p["attack_until"]:
+                                    outline="#f2d5a5", width=2, tags="frame")
+        if now < p["shoot_until"]:
             fx, fy = facing
-            self.canvas.create_arc(
-                p["x"] - 51, p["y"] - 51, p["x"] + 51, p["y"] + 51,
-                start=-math.degrees(math.atan2(fy, fx)) - 40, extent=80,
-                style=tk.ARC, outline="#f3dc9c", width=4
-            )
+            self.canvas.create_line(p["x"] + fx * 20, p["y"] + fy * 20,
+                                    p["x"] + fx * 37, p["y"] + fy * 37,
+                                    fill="#fff1b0", width=4, tags="frame")
 
         if now < self.message_until:
-            self.canvas.create_text(WIDTH / 2, 103, text=self.message,
-                                    fill="#f0d99f", font=("Segoe UI", 12, "bold"))
+            self.canvas.create_text(WIDTH / 2, 128, text=self.message,
+                                    fill="#f0d99f", font=("Segoe UI", 12, "bold"),
+                                    tags="frame")
         self.canvas.create_text(WIDTH / 2, HEIGHT - 22,
-                                text="WASD / ARROWS  MOVE     SPACE  ATTACK     ESC  PAUSE",
-                                fill="#b9c1ac", font=("Segoe UI", 9, "bold"))
+                                text="WASD / ARROWS MOVE   SPACE / CLICK SHOOT   1 BOSS SKILL   E INTERACT   ESC PAUSE",
+                                fill="#b9c1ac", font=("Segoe UI", 9, "bold"), tags="frame")
+        self.draw_skill_dialogue()
+        if self.active_quest:
+            quest_title, _, quest_target = self.active_quest
+            quest_status = ("COMPLETE" if self.quest_complete else
+                            f"{self.quest_progress}/{quest_target}")
+            self.canvas.create_text(WIDTH - 170, 116,
+                                    text=f"QUEST: {quest_title}  {quest_status}",
+                                    fill="#e5c874", font=("Segoe UI", 9, "bold"),
+                                    tags="frame")
+
+    def draw_knockdown(self, x, y):
+        c = self.canvas
+        c.create_oval(x - 24, y - 10, x + 24, y + 10, fill="#252b27",
+                      outline="", tags="frame")
+        c.create_oval(x - 16, y - 7, x + 12, y + 7, fill="#527e87",
+                      outline="#d5d9c0", width=2, tags="frame")
+        c.create_oval(x + 8, y - 8, x + 22, y + 6, fill="#77866a",
+                      outline="#353b32", width=1, tags="frame")
+        c.create_line(x - 7, y, x + 13, y, fill="#292c29", width=4, tags="frame")
+        c.create_text(x, y - 20, text="STUNNED", fill="#f0d7a2",
+                      font=("Segoe UI", 8, "bold"), tags="frame")
+
+    def draw_region_select(self):
+        boss_kills = self.wave // 4
+        choices = [
+            (self.region + 1) % len(REGIONS),
+            (self.region + 2) % len(REGIONS),
+        ]
+        self.canvas.create_rectangle(0, 0, WIDTH, HEIGHT, fill="#101718",
+                                     stipple="gray50", outline="", tags="frame")
+        self.canvas.create_text(WIDTH / 2, 185, text="WARLORD DEFEATED",
+                                fill="#f0d7c5", font=("Segoe UI", 28, "bold"),
+                                tags="frame")
+        self.canvas.create_text(
+            WIDTH / 2, 235,
+            text=f'"{self.boss_skill()[2]}"  -  {self.boss_name()}',
+            fill="#e2c98e", font=("Segoe UI", 11), tags="frame"
+        )
+        self.canvas.create_text(
+            WIDTH / 2, 280,
+            text=f"Territory {boss_kills} claimed. Choose the next region to travel to:",
+            fill="#d0d4c2", font=("Segoe UI", 12), tags="frame"
+        )
+        for index, region_id in enumerate(choices):
+            x1 = 90 + index * 410
+            x2 = x1 + 350
+            self.canvas.create_rectangle(x1, 320, x2, 410, fill="#39453b",
+                                         outline="#d4bd91", width=2, tags="frame")
+            self.canvas.create_text((x1 + x2) / 2, 350, text=REGIONS[region_id][0],
+                                    fill="#f0dfb8", font=("Segoe UI", 17, "bold"),
+                                    tags="frame")
+            claim_text = "CLAIMED" if self.territories[region_id] else "UNCLAIMED"
+            self.canvas.create_text((x1 + x2) / 2, 383,
+                                    text=f"{claim_text}  -  CLICK TO TRAVEL",
+                                    fill="#d0d4c2", font=("Segoe UI", 10, "bold"),
+                                    tags="frame")
+        self.canvas.create_text(WIDTH / 2, 463,
+                                text=f"Boss skill acquired: {self.boss_skill()[0]}. Press 1 to use it.",
+                                fill="#9fe0ce", font=("Segoe UI", 12, "bold"), tags="frame")
+        if len(self.unlocked_abilities) > 1:
+            skills = ", ".join(skill[0] for skill in self.unlocked_abilities)
+            self.canvas.create_text(WIDTH / 2, 480,
+                                    text=f"Unlocked skills: {skills}. Press 2 to cycle.",
+                                    fill="#c2c7b9", font=("Segoe UI", 9), tags="frame")
+        self.canvas.create_text(WIDTH / 2, 495,
+                                text="Collect dropped coins by walking over them. Space or click to shoot.",
+                                fill="#c2c7b9", font=("Segoe UI", 10), tags="frame")
+
+    def draw_stage_intro(self):
+        self.canvas.create_rectangle(
+            WIDTH / 2 - 210, HEIGHT / 2 - 70,
+            WIDTH / 2 + 210, HEIGHT / 2 + 70,
+            fill="#18201f", outline="#d4bd91", width=2, tags="frame"
+        )
+        self.canvas.create_text(WIDTH / 2, HEIGHT / 2 - 24,
+                                text=self.stage_label(),
+                                fill="#f1dfb8", font=("Segoe UI", 30, "bold"),
+                                tags="frame")
+        self.canvas.create_text(WIDTH / 2, HEIGHT / 2 + 23,
+                                text=f"REGION  {REGIONS[self.region][0]}",
+                                fill="#d3c28f", font=("Segoe UI", 12, "bold"),
+                                tags="frame")
+
+    def draw_boss_warning(self, now):
+        c = self.canvas
+        c.create_rectangle(0, 0, WIDTH, HEIGHT, fill="#080b10", outline="", tags="frame")
+        shake = math.sin(now * 37) * 5
+        tear_x = WIDTH * 0.53 + shake
+        c.create_polygon(
+            tear_x - 20, 70, tear_x + 9, 70, tear_x - 8, 177,
+            tear_x + 22, 262, tear_x - 15, 344, tear_x + 12, 453,
+            tear_x - 7, HEIGHT - 48, tear_x - 31, HEIGHT - 48,
+            tear_x - 4, 453, tear_x - 37, 344, tear_x - 5, 262,
+            tear_x - 34, 177, fill="#b9c9d1", outline="#f2e7d4",
+            width=2, tags="frame"
+        )
+        c.create_line(tear_x, 82, tear_x - 28, 180, tear_x + 15, 260,
+                      tear_x - 21, 344, tear_x + 8, 446,
+                      fill="#fff3d4", width=4, tags="frame")
+        c.create_text(WIDTH / 2, 150, text="THE SKY RIPS OPEN",
+                      fill="#d7e3e5", font=("Segoe UI", 23, "bold"), tags="frame")
+        c.create_text(WIDTH / 2, 236, text=f'{self.boss_name().upper()}',
+                      fill="#e2a99a", font=("Segoe UI", 29, "bold"), tags="frame")
+        c.create_text(WIDTH / 2, 295, text=f'"{self.boss_dialogue()}"',
+                      fill="#f7e8d0", font=("Segoe UI", 22, "bold"),
+                      width=800, tags="frame")
+        remaining = max(0, self.boss_warning_until - now)
+        c.create_text(WIDTH / 2, 365, text=f"ENTERING THE BATTLEFIELD  {remaining:.1f}",
+                      fill="#c7c7c2", font=("Segoe UI", 13, "bold"), tags="frame")
+
+    def draw_tower_exterior(self):
+        c = self.canvas
+        c.create_rectangle(0, 0, WIDTH, HEIGHT, fill="#121619", tags="frame")
+        for x in range(0, WIDTH, 80):
+            c.create_line(x, 0, WIDTH / 2, 370, fill="#20282a", width=2,
+                          tags="frame")
+        c.create_polygon(300, 520, 335, 170, 390, 105, 570, 105,
+                         625, 170, 660, 520, fill="#303638",
+                         outline="#a78d60", width=4, tags="frame")
+        c.create_polygon(390, 180, 480, 90, 570, 180,
+                         fill="#252c2e", outline="#c1a56d", width=3, tags="frame")
+        c.create_rectangle(385, 280, 575, 520, fill="#111719",
+                           outline="#c1a56d", width=3, tags="frame")
+        c.create_arc(385, 235, 575, 385, start=0, extent=180,
+                     style=tk.ARC, outline="#c1a56d", width=3, tags="frame")
+        c.create_text(WIDTH / 2, 48, text="THE TOWER OF THE VEIL",
+                      fill="#e5c874", font=("Segoe UI", 22, "bold"),
+                      tags="frame")
+        c.create_text(WIDTH / 2, 557,
+                      text="ENTER THE TOWER  -  PRESS E OR CLICK THE GATE",
+                      fill="#fff1d2", font=("Segoe UI", 12, "bold"),
+                      tags="frame")
+
+    def draw_hall(self, c, vanishing_x, vanishing_y, now):
+        c.create_rectangle(0, 0, WIDTH, HEIGHT, fill="#15191d", tags="frame")
+        for index in range(7):
+            x = vanishing_x + (index - 3) * 112
+            c.create_polygon(x, vanishing_y, x - 76, HEIGHT, x - 18, HEIGHT,
+                             fill="#4a3b2e", stipple="gray75", outline="",
+                             tags="frame")
+        c.create_polygon(0, 0, WIDTH, 0, vanishing_x + 130, vanishing_y,
+                         vanishing_x - 130, vanishing_y,
+                         fill="#25282b", outline="", tags="frame")
+        c.create_polygon(0, HEIGHT, WIDTH, HEIGHT, vanishing_x + 130, vanishing_y,
+                         vanishing_x - 130, vanishing_y,
+                         fill="#333337", outline="#8b7557", width=2, tags="frame")
+        for index in range(11):
+            x = index * 100
+            c.create_line(x, HEIGHT, vanishing_x, vanishing_y,
+                          fill="#585044", width=1, tags="frame")
+        for depth in (0.25, 0.43, 0.62, 0.82):
+            y = vanishing_y + (HEIGHT - vanishing_y) * depth
+            c.create_line(0, y, WIDTH, y, fill="#51483f", width=2, tags="frame")
+        for side in (-1, 1):
+            for index in range(4):
+                depth = (index + 1) / 5
+                center_x = vanishing_x + side * (120 + depth * 370)
+                base_y = vanishing_y + depth * 420
+                half = 13 + depth * 43
+                torch_y = base_y - (45 + depth * 110)
+                glow = 13 + 3 * math.sin(now * 5 + index * 2 + side)
+                c.create_oval(center_x - glow, torch_y - glow,
+                              center_x + glow, torch_y + glow,
+                              fill="#c1914d", stipple="gray50", outline="",
+                              tags="frame")
+                c.create_polygon(
+                    center_x - half, base_y,
+                    center_x - half * 0.65, base_y - (45 + depth * 110),
+                    center_x + half * 0.65, base_y - (45 + depth * 110),
+                    center_x + half, base_y,
+                    fill="#4a4741", outline="#93805f", width=2, tags="frame"
+                )
+                c.create_oval(center_x - half * 0.55, torch_y - 10 * depth,
+                              center_x + half * 0.55, torch_y + 10 * depth,
+                              fill="#c1914d", outline="#d9b66f", tags="frame")
+
+    def draw_demon_king(self, x, y, scale=1, wings=True, pulled=0,
+                        animation_time=None):
+        c = self.canvas
+        wing_flap = (math.sin(animation_time * 9) * 18 * scale
+                     if animation_time is not None else 0)
+        if wings:
+            c.create_polygon(x - 18 * scale, y - 10 * scale,
+                             x - 100 * scale, y - 82 * scale - wing_flap,
+                             x - 73 * scale, y + 3 * scale - wing_flap * 0.35,
+                             x - 112 * scale, y + 35 * scale + wing_flap * 0.45,
+                             x - 25 * scale, y + 40 * scale,
+                             fill="#4c2938", outline="#c16a5d", width=2,
+                             tags="frame")
+            c.create_polygon(x + 18 * scale, y - 10 * scale,
+                             x + 100 * scale, y - 82 * scale - wing_flap,
+                             x + 73 * scale, y + 3 * scale - wing_flap * 0.35,
+                             x + 112 * scale, y + 35 * scale + wing_flap * 0.45,
+                             x + 25 * scale, y + 40 * scale,
+                             fill="#4c2938", outline="#c16a5d", width=2,
+                             tags="frame")
+        c.create_oval(x - 23 * scale, y - 52 * scale,
+                      x + 23 * scale, y - 5 * scale,
+                      fill="#a45b48", outline="#e2bb83", width=2, tags="frame")
+        c.create_polygon(x - 18 * scale, y - 42 * scale,
+                         x - 40 * scale, y - 88 * scale,
+                         x - 7 * scale, y - 60 * scale,
+                         fill="#d2a264", outline="#f0d7a2", tags="frame")
+        c.create_polygon(x + 18 * scale, y - 42 * scale,
+                         x + 40 * scale, y - 88 * scale,
+                         x + 7 * scale, y - 60 * scale,
+                         fill="#d2a264", outline="#f0d7a2", tags="frame")
+        c.create_polygon(x - 32 * scale, y + 44 * scale,
+                         x + 32 * scale, y + 44 * scale,
+                         x + 22 * scale, y - 15 * scale,
+                         x - 22 * scale, y - 15 * scale,
+                         fill="#563444", outline="#c17d67", width=2, tags="frame")
+        for side in (-1, 1):
+            c.create_oval(x + side * 8 * scale - 3 * scale,
+                          y - 34 * scale - 3 * scale,
+                          x + side * 8 * scale + 3 * scale,
+                          y - 34 * scale + 3 * scale,
+                          fill="#f3cf68", outline="", tags="frame")
+        c.create_line(x - 10 * scale, y - 5 * scale,
+                      x + 10 * scale, y - 5 * scale,
+                      fill="#f0d7c5", width=max(1, int(2 * scale)), tags="frame")
+
+    def draw_opening_cutscene(self, now):
+        elapsed = min(12, max(0, now - self.opening_cutscene_started))
+        walk_progress = min(1, elapsed / 4)
+        vanishing_x = WIDTH / 2 + math.sin(elapsed * 0.7) * 38
+        vanishing_y = 205 + walk_progress * 42 + math.sin(elapsed * 1.2) * 5
+        self.draw_hall(self.canvas, vanishing_x, vanishing_y, now)
+
+        if elapsed < 4:
+            for index in range(22):
+                angle = index * math.tau / 22
+                inner = 35 + (index % 4) * 14
+                outer = 130 + (index % 5) * 34
+                drift = (now * (85 + index % 4 * 24)) % 105
+                self.canvas.create_line(
+                    vanishing_x + math.cos(angle) * (inner + drift),
+                    vanishing_y + math.sin(angle) * (inner + drift),
+                    vanishing_x + math.cos(angle) * (outer + drift),
+                    vanishing_y + math.sin(angle) * (outer + drift),
+                    fill="#bba77d", width=1, tags="frame"
+                )
+
+        flash = max(0, 1 - abs(elapsed - 4.05) / 0.28)
+        if flash:
+            self.canvas.create_rectangle(
+                0, 0, WIDTH, HEIGHT, fill="#d9efff",
+                stipple="gray75", outline="", tags="frame"
+            )
+
+        demon_x, demon_y, demon_scale = WIDTH / 2, 315, 1.3
+        if elapsed < 4:
+            scout_y = HEIGHT - 125 - walk_progress * 245
+            scout_x = WIDTH / 2 + math.sin(elapsed * 1.7) * 12
+            self.canvas.create_text(WIDTH / 2, HEIGHT - 38,
+                                    text="A NEW JOURNEY BEGINS",
+                                    fill="#e3ddd0", font=("Segoe UI", 12, "bold"),
+                                    tags="frame")
+            self.draw_entity(scout_x, scout_y, 22 - walk_progress * 12,
+                             "#72a2ad", "#d5d9c0", (0, -1), "scout",
+                             moving=True)
+        elif elapsed < 7:
+            arrival = min(1, (elapsed - 4) / 1.35)
+            arrival = arrival * arrival * (3 - 2 * arrival)
+            demon_x = WIDTH + 145 - arrival * (WIDTH / 2 + 145)
+            demon_y = 315 + math.sin(elapsed * 3.2) * 10
+            demon_scale = 0.75 + arrival * 0.62
+            pulse = 72 + 9 * math.sin(now * 7)
+            for index in range(18):
+                angle = index * math.tau / 18 + now * 0.12
+                inner = 95 + (index % 3) * 12
+                outer = 175 + (index % 4) * 24
+                self.canvas.create_line(
+                    demon_x + math.cos(angle) * inner,
+                    demon_y + math.sin(angle) * inner,
+                    demon_x + math.cos(angle) * outer,
+                    demon_y + math.sin(angle) * outer,
+                    fill="#8c5264", width=2, tags="frame"
+                )
+            self.canvas.create_oval(demon_x - pulse, demon_y - pulse * 1.35,
+                                    demon_x + pulse, demon_y + pulse * 1.35,
+                                    outline="#bb6681", width=3, tags="frame")
+            for side in (-1, 1):
+                self.canvas.create_line(
+                    demon_x + side * 115, demon_y - 100,
+                    demon_x + side * 26, demon_y + 10,
+                    fill="#edb1bd", width=3, tags="frame"
+                )
+            self.draw_demon_king(demon_x, demon_y, scale=demon_scale,
+                                 animation_time=now)
+        elif elapsed < 9:
+            self.canvas.create_rectangle(0, 0, WIDTH, HEIGHT,
+                                         fill="#8bb4ca", stipple="gray75",
+                                         outline="", tags="frame")
+            for index in range(32):
+                angle = index * math.tau / 32 + now * 0.18
+                inner = 58 + (index % 4) * 9
+                outer = inner + 34 + (index % 3) * 17
+                self.canvas.create_line(
+                    demon_x + math.cos(angle) * inner,
+                    demon_y + math.sin(angle) * inner,
+                    demon_x + math.cos(angle) * outer,
+                    demon_y + math.sin(angle) * outer,
+                    fill="#d9f0ff", width=2, tags="frame"
+                )
+            for index in range(26):
+                drift = (now * (24 + index % 5 * 8) + index * 61) % HEIGHT
+                x = (index * 83 + 31 + math.sin(now + index) * 12) % WIDTH
+                self.canvas.create_polygon(
+                    x, drift, x + 4, drift + 13, x - 3, drift + 19,
+                    fill="#f3e8c6", outline="#c9efff", tags="frame"
+                )
+            self.draw_demon_king(demon_x, demon_y, scale=demon_scale,
+                                 animation_time=now)
+        else:
+            pull = min(1, (elapsed - 9) / 2)
+            pull = pull * pull * (3 - 2 * pull)
+            portal_x = WIDTH / 2 + 285
+            portal_pulse = 8 * math.sin(now * 8)
+            self.canvas.create_oval(portal_x - 62 - portal_pulse, 198,
+                                    portal_x + 62 + portal_pulse, 432,
+                                    fill="#21132e", outline="#9f66bd",
+                                    width=8, tags="frame")
+            for ring in range(3):
+                inset = ring * 13
+                self.canvas.create_arc(
+                    portal_x - 50 + inset, 210 + inset,
+                    portal_x + 50 - inset, 420 - inset,
+                    start=(now * 100 + ring * 120) % 360,
+                    extent=235, style=tk.ARC,
+                    outline="#e0b5ff" if ring % 2 == 0 else "#8e55bf",
+                    width=3, tags="frame"
+                )
+            demon_x = WIDTH / 2 + pull * 260
+            demon_y = 315 - pull * 25
+            demon_scale = max(0.06, 1.37 - pull * 1.32)
+            self.canvas.create_line(demon_x - 28, demon_y,
+                                    portal_x - 48, 315,
+                                    fill="#7540a5", width=12, tags="frame")
+            self.canvas.create_line(demon_x - 22, demon_y,
+                                    portal_x - 48, 315,
+                                    fill="#e1a9ff", width=3, tags="frame")
+            for index in range(18):
+                angle = index * math.tau / 18 + now * 1.1
+                radius = 30 + (index % 5) * 18 + pull * 38
+                x = demon_x + math.cos(angle) * radius
+                y = demon_y + math.sin(angle) * radius
+                self.canvas.create_oval(x - 2, y - 2, x + 3, y + 3,
+                                        fill="#dfb6ff", outline="", tags="frame")
+            self.draw_demon_king(demon_x, demon_y, scale=demon_scale,
+                                 animation_time=now)
+
+        if elapsed < 6.6:
+            dialogue = "WELCOME TO MY WORLD OF DEATH AND DESIRE!"
+        elif elapsed < 9:
+            dialogue = ("YOU HAVE TO MAKE YOUR WAY FROM THE 1ST STAGE TO THE "
+                        "100TH FLOOR, WHERE MY MINION WILL FIGHT YOU WITH "
+                        "50% OF MY ORIGINAL POWERS...")
+        elif elapsed < 10.8:
+            dialogue = ("THEN, AFTER 100 MORE FLOORS, FIND AND DEFEAT ME "
+                        "TO BECOME THE TOWER KING...")
+        else:
+            dialogue = "HELP!!"
+        if elapsed >= 4:
+            self.canvas.create_rectangle(0, 480, WIDTH, 590, fill="#101214",
+                                         stipple="gray50", outline="",
+                                         tags="frame")
+            self.canvas.create_line(110, 485, 850, 485,
+                                    fill="#c17d67", width=2, tags="frame")
+            self.canvas.create_text(130, 506, text="DEMON KING",
+                                    anchor="w", fill="#e5c874",
+                                    font=("Segoe UI", 10, "bold"),
+                                    tags="frame")
+            self.canvas.create_text(WIDTH / 2, 546, text=f'"{dialogue}"',
+                                    width=730, fill="#fff1d2",
+                                    font=("Segoe UI", 14, "bold"), tags="frame")
+        if elapsed > 9:
+            self.canvas.create_text(WIDTH / 2, 615,
+                                    text="A DARK FORCE DRAGS HIM INTO THE PORTAL",
+                                    fill="#cf9bd9", font=("Segoe UI", 9, "bold"),
+                                    tags="frame")
+        self.canvas.create_rectangle(0, 0, WIDTH, 25, fill="#090b0e",
+                                     outline="", tags="frame")
+        self.canvas.create_rectangle(0, HEIGHT - 22, WIDTH, HEIGHT,
+                                     fill="#090b0e", outline="", tags="frame")
+        self.canvas.create_text(28, 12, text="THE TOWER OF THE VEIL",
+                                anchor="w", fill="#d7c69f",
+                                font=("Segoe UI", 8, "bold"), tags="frame")
+        self.canvas.create_text(WIDTH - 28, 12,
+                                text=f"PROLOGUE  /  {min(12, int(elapsed)):02d}:12",
+                                anchor="e", fill="#d7c69f",
+                                font=("Segoe UI", 8, "bold"), tags="frame")
+        for impact_time, strength in ((4.05, 7), (7.0, 4), (9.1, 5), (11.4, 3)):
+            impact = max(0, 1 - abs(elapsed - impact_time) / 0.3)
+            if impact:
+                self.canvas.move(
+                    "frame",
+                    math.sin(now * 95) * strength * impact,
+                    math.cos(now * 83) * strength * impact
+                )
+
+    def draw_tower_gate(self):
+        self.draw_hall(self.canvas, WIDTH / 2, 200, time.monotonic())
+        gate_x, gate_y = WIDTH / 2, ARENA[1] + 208
+        pulse = 8 + math.sin(time.monotonic() * 4) * 5
+        self.canvas.create_oval(gate_x - 42 - pulse, gate_y - 58 - pulse,
+                                gate_x + 42 + pulse, gate_y + 58 + pulse,
+                                fill="#221331", outline="#a86aca", width=4,
+                                tags="frame")
+        self.canvas.create_text(gate_x, gate_y, text="FLOOR 1",
+                                fill="#f5dc9b", font=("Segoe UI", 10, "bold"),
+                                tags="frame")
+        self.canvas.create_rectangle(375, 195, 585, 335, fill="#303036",
+                                     outline="#c4a56a", width=4, tags="frame")
+        self.canvas.create_text(WIDTH / 2, 235, text="THE THRONE",
+                                fill="#f0d7c5", font=("Segoe UI", 15, "bold"),
+                                tags="frame")
+        self.canvas.create_polygon(420, 325, 435, 260, 525, 260, 540, 325,
+                                  fill="#613849", outline="#cfaa70",
+                                  width=3, tags="frame")
+        self.draw_entity(self.player["x"], self.player["y"], 15,
+                         "#72a2ad", "#d5d9c0", (1, 0), "scout",
+                         moving=bool(self.keys))
+        self.canvas.create_text(WIDTH / 2, 38,
+                                text="THE PORTAL IS HIDDEN BEHIND THE THRONE",
+                                fill="#f0d7c5", font=("Segoe UI", 16, "bold"),
+                                tags="frame")
+        self.canvas.create_text(WIDTH / 2, HEIGHT - 22,
+                                text="MOVE WITH WASD / ARROWS  -  STAND BY THE PORTAL AND PRESS E",
+                                fill="#fff1d2", font=("Segoe UI", 10, "bold"),
+                                tags="frame")
+
+    def draw_quest_select(self):
+        self.canvas.create_rectangle(0, 0, WIDTH, HEIGHT, fill="#101718",
+                                     stipple="gray50", outline="", tags="frame")
+        floor = min(100, self.stage_number())
+        self.canvas.create_text(WIDTH / 2, 105,
+                                text=f"FLOOR {floor}  -  CHOOSE A QUEST",
+                                fill="#f0d7c5", font=("Segoe UI", 27, "bold"),
+                                tags="frame")
+        self.canvas.create_text(WIDTH / 2, 158,
+                                text="HIGHER-RISK QUESTS PAY MORE",
+                                fill="#e5c874", font=("Segoe UI", 13, "bold"),
+                                tags="frame")
+        for index, (title, description, target) in enumerate(QUEST_OPTIONS):
+            x1 = 80 + index * 275
+            x2 = x1 + 245
+            self.canvas.create_rectangle(x1, 245, x2, 455,
+                                         fill="#35443d", outline="#d4bd91",
+                                         width=2, tags="frame")
+            self.canvas.create_text((x1 + x2) / 2, 292, text=f"QUEST {index + 1}",
+                                    fill="#c8b487", font=("Segoe UI", 11, "bold"),
+                                    tags="frame")
+            self.canvas.create_text((x1 + x2) / 2, 342, text=title,
+                                    width=210, fill="#f0dfb8",
+                                    font=("Segoe UI", 15, "bold"), tags="frame")
+            self.canvas.create_text((x1 + x2) / 2, 390, text=description,
+                                    fill="#c2c7b9", font=("Segoe UI", 11),
+                                    tags="frame")
+            self.canvas.create_text((x1 + x2) / 2, 430,
+                                    text=f"REWARD  {self.quest_rewards[index]} COINS",
+                                    fill="#e5c874", font=("Segoe UI", 10, "bold"),
+                                    tags="frame")
+        self.canvas.create_text(WIDTH / 2, 510,
+                                text="CHOOSE ONE QUEST BEFORE ENTERING THE FLOOR",
+                                fill="#d0d4c2", font=("Segoe UI", 11, "bold"),
+                                tags="frame")
+
+    def draw_minion_reveal(self, now):
+        remaining = max(0, self.boss_dialogue_until - now)
+        self.canvas.create_rectangle(100, 465, WIDTH - 100, 570,
+                                     fill="#101214", stipple="gray50",
+                                     outline="#d4bd91", width=2, tags="frame")
+        self.canvas.create_text(WIDTH / 2, 490, text="THE MINION'S CLUE",
+                                fill="#e5c874", font=("Segoe UI", 13, "bold"),
+                                tags="frame")
+        self.canvas.create_text(WIDTH / 2, 520, text=self.clue_dialogue,
+                                width=720, fill="#f0d7c5",
+                                font=("Segoe UI", 11, "bold"), tags="frame")
+        self.canvas.create_text(WIDTH / 2, 550,
+                                text=f"CLUES FOUND  {len(self.tower_clues)}/{len(TOWER_MINIONS)}"
+                                + (f"  -  {remaining:.1f}" if remaining else ""),
+                                fill="#c2c7b9", font=("Segoe UI", 9, "bold"),
+                                tags="frame")
+
+    def draw_kidnapper_reveal(self, now):
+        elapsed = 6 - max(0, self.kidnapper_reveal_until - now)
+        self.canvas.create_rectangle(0, 0, WIDTH, HEIGHT, fill="#090a0d",
+                                     stipple="gray50", outline="", tags="frame")
+        self.draw_demon_king(355, 310, scale=1.1)
+        self.canvas.create_text(640, 205, text="SCOUT: WHY DID YOU KIDNAP HIM?",
+                                width=430, fill="#f0d7c5",
+                                font=("Segoe UI", 13, "bold"), tags="frame")
+        if elapsed < 2:
+            answer = "VEIL THIEF: I TOOK HIM TO KEEP THE FIRST GATE SEALED."
+        elif elapsed < 4:
+            answer = "VEIL THIEF: I AM THE SHADOW HE CAST AWAY."
+        else:
+            answer = "VEIL THIEF: I AM HIS OTHER SELF—"
+        self.canvas.create_text(640, 275, text=f'"{answer}"', width=480,
+                                fill="#d4b8ed", font=("Segoe UI", 12, "bold"),
+                                tags="frame")
+        self.canvas.create_oval(720, 350, 850, 500, fill="#17101f",
+                                outline="#9f66bd", width=6, tags="frame")
+        if elapsed > 4:
+            self.canvas.create_text(640, 390, text="THE VEIL THIEF VANISHES",
+                                    fill="#e5c874", font=("Segoe UI", 16, "bold"),
+                                    tags="frame")
+        self.canvas.create_text(WIDTH / 2, 565,
+                                text="THE DEMON KING IS FREE. THE TOWER CROWN IS YOURS.",
+                                fill="#f0d7c5", font=("Segoe UI", 13, "bold"),
+                                tags="frame")
+
+    def draw_victory(self):
+        self.canvas.create_rectangle(0, 0, WIDTH, HEIGHT, fill="#101214",
+                                     tags="frame")
+        self.draw_demon_king(330, 310, scale=1.25)
+        self.draw_entity(600, 360, 28, "#72a2ad", "#d5d9c0",
+                         (1, 0), "scout")
+        self.canvas.create_text(WIDTH / 2, 110, text="TOWER KING",
+                                fill="#f1d59d", font=("Segoe UI", 40, "bold"),
+                                tags="frame")
+        self.canvas.create_text(WIDTH / 2, 475,
+                                text="THE DEMON KING IS FREE. YOUR CLIMB IS COMPLETE.",
+                                width=800, fill="#e3ddd0",
+                                font=("Segoe UI", 13, "bold"), tags="frame")
+
+    def draw_cosmetic_chest(self):
+        category, name = self.pending_cosmetic_chest
+        clicks = self.cosmetic_chest_clicks
+        self.canvas.create_rectangle(0, 0, WIDTH, HEIGHT, fill="#101718",
+                                     stipple="gray50", outline="", tags="frame")
+        self.canvas.create_text(WIDTH / 2, 150, text="A NEW ITEM!",
+                                fill="#f0d7c5", font=("Segoe UI", 28, "bold"),
+                                tags="frame")
+        self.canvas.create_text(WIDTH / 2, 195, text=f"{category}: {name}",
+                                fill="#e5c874", font=("Segoe UI", 17, "bold"),
+                                tags="frame")
+        chest_x, chest_y = WIDTH / 2, 355
+        self.canvas.create_oval(chest_x - 118, chest_y + 45,
+                                chest_x + 118, chest_y + 75,
+                                fill="#080b10", outline="", tags="frame")
+        self.canvas.create_rectangle(chest_x - 90, chest_y - 10,
+                                     chest_x + 90, chest_y + 52,
+                                     fill="#704c32", outline="#f0c45a",
+                                     width=4, tags="frame")
+        self.canvas.create_rectangle(chest_x - 90, chest_y + 7,
+                                     chest_x + 90, chest_y + 23,
+                                     fill="#c28c3d", outline="#f0c45a",
+                                     width=2, tags="frame")
+        self.canvas.create_rectangle(chest_x - 13, chest_y + 2,
+                                     chest_x + 13, chest_y + 33,
+                                     fill="#f3e5a5", outline="#fff1d2",
+                                     width=2, tags="frame")
+        lid_lift = min(clicks, 5) * 5
+        self.canvas.create_polygon(
+            chest_x - 90, chest_y - 10,
+            chest_x - 75, chest_y - 60 - lid_lift,
+            chest_x + 75, chest_y - 60 - lid_lift,
+            chest_x + 90, chest_y - 10,
+            fill="#8b5a35", outline="#f0c45a", width=4, tags="frame"
+        )
+        self.canvas.create_text(WIDTH / 2, 465,
+                                text=f"CLICK THE CHEST  {clicks}/5",
+                                fill="#fff1d2", font=("Segoe UI", 14, "bold"),
+                                tags="frame")
+        self.canvas.create_text(WIDTH / 2, 500,
+                                text="CLICK FIVE TIMES TO OPEN IT",
+                                fill="#c2c7b9", font=("Segoe UI", 10, "bold"),
+                                tags="frame")
+
+    def draw_post_boss(self, now):
+        remaining = max(0, self.travel_ready_at - now)
+        self.canvas.create_rectangle(96, 512, WIDTH - 96, 612,
+                                     fill="#18201f", outline="#d4bd91",
+                                     width=2, tags="frame")
+        self.canvas.create_text(WIDTH / 2, 530,
+                                text=f"COINS: {self.coins}   |   COLLECT THE BOSS'S COINS BEFORE YOU GO",
+                                fill="#e5c874", font=("Segoe UI", 11, "bold"),
+                                tags="frame")
+        if remaining <= 0:
+            stage_text = "NEXT STAGE READY  -  MOVE WITH WASD / ARROWS"
+        else:
+            stage_text = f"NEXT STAGE IN {remaining:.1f} SECONDS  -  MOVE WITH WASD / ARROWS"
+        self.canvas.create_text(WIDTH / 2, 550,
+                                text=stage_text,
+                                fill="#d8c58f", font=("Segoe UI", 10, "bold"),
+                                tags="frame")
+        if self.rescue_route_unlocked:
+            buttons = (
+                (80, 560, 260, 600, "SHOP  B"),
+                (270, 560, 450, 600, "TERRAIN  M"),
+                (470, 560, 670, 600, "RESCUE ROUTE"),
+                (690, 560, 880, 600, "KEEP CLIMBING"),
+            )
+        else:
+            buttons = (
+                (110, 560, 300, 600, "SHOP  B"),
+                (320, 560, 520, 600, "TERRAIN  M"),
+                (650, 560, 850, 600, "NEXT FLOOR"),
+            )
+        if self.rescue_route_unlocked:
+            clue_status = f"FIVE CLUES FOUND  |  {len(self.tower_clues)}/{len(TOWER_MINIONS)}"
+            self.canvas.create_text(WIDTH / 2, 545, text=clue_status,
+                                    fill="#e5c874", font=("Segoe UI", 9, "bold"),
+                                    tags="frame")
+        for x1, y1, x2, y2, label in buttons:
+            enabled = label not in ("NEXT FLOOR", "KEEP CLIMBING") or remaining <= 0
+            fill = "#53634d" if enabled else "#343b38"
+            self.canvas.create_rectangle(x1, y1, x2, y2, fill=fill,
+                                         outline="#d4bd91", width=1, tags="frame")
+            self.canvas.create_text((x1 + x2) / 2, (y1 + y2) / 2,
+                                    text=label, fill="#fff1d2",
+                                    font=("Segoe UI", 10, "bold"), tags="frame")
+
+    def draw_auto_aim_prompt(self):
+        next_stage = ROMAN_NUMERALS[(self.stage_number() - 1) % len(ROMAN_NUMERALS)]
+        self.canvas.create_rectangle(0, 0, WIDTH, HEIGHT, fill="#101718",
+                                     stipple="gray50", outline="", tags="frame")
+        self.canvas.create_rectangle(130, 205, WIDTH - 130, 405,
+                                     fill="#18201f", outline="#d4bd91",
+                                     width=2, tags="frame")
+        self.canvas.create_text(WIDTH / 2, 250,
+                                text=f"STAGE {next_stage}  -  AUTO AIM",
+                                fill="#f0d7c5", font=("Segoe UI", 23, "bold"),
+                                tags="frame")
+        self.canvas.create_text(WIDTH / 2, 292,
+                                text="Continue using auto aim for this stage?",
+                                fill="#d8c58f", font=("Segoe UI", 13, "bold"),
+                                tags="frame")
+        for x1, x2, label in ((170, 460, "YES  -  KEEP AUTO AIM"),
+                              (500, 790, "NO  -  TURN IT OFF")):
+            self.canvas.create_rectangle(x1, 320, x2, 360, fill="#53634d",
+                                         outline="#d4bd91", width=1, tags="frame")
+            self.canvas.create_text((x1 + x2) / 2, 340, text=label,
+                                    fill="#fff1d2", font=("Segoe UI", 10, "bold"),
+                                    tags="frame")
+        self.canvas.create_text(WIDTH / 2, 385,
+                                text="AUTO AIM IS ALWAYS OFF AT THE START OF A NEW RUN.",
+                                fill="#b9c1ac", font=("Segoe UI", 9, "bold"),
+                                tags="frame")
+
+    def draw_character_customization(self):
+        self.canvas.create_rectangle(0, 0, WIDTH, HEIGHT, fill="#101718",
+                                     stipple="gray50", outline="", tags="frame")
+        self.canvas.create_text(WIDTH / 2, 58, text="CHARACTER CUSTOMIZATION",
+                                fill="#f0d7c5", font=("Segoe UI", 25, "bold"),
+                                tags="frame")
+        self.canvas.create_text(WIDTH - 50, 94, text=f"COINS: {self.coins}",
+                                anchor="e", fill="#e5c874",
+                                font=("Segoe UI", 12, "bold"), tags="frame")
+
+        categories = tuple(COSMETIC_ITEMS)
+        for index, category in enumerate(categories):
+            x1 = 30 + index * 180
+            x2 = x1 + 160
+            fill = "#74563d" if index == self.customize_category else "#35443d"
+            self.canvas.create_rectangle(x1, 125, x2, 170, fill=fill,
+                                         outline="#d4bd91", width=1, tags="frame")
+            self.canvas.create_text((x1 + x2) / 2, 147, text=category,
+                                    fill="#fff1d2", font=("Segoe UI", 10, "bold"),
+                                    tags="frame")
+            self.canvas.create_text(330, 190,
+                                    text="SELECT AN ITEM TO PREVIEW IT BEFORE BUYING",
+                                    fill="#c2c7b9", font=("Segoe UI", 9, "bold"),
+                                    tags="frame")
+
+            category = categories[self.customize_category]
+        for index, (name, cost, color) in enumerate(COSMETIC_ITEMS[category]):
+            y1 = 210 + index * 70
+            y2 = y1 + 58
+            fill = "#74563d" if index == self.customize_item else "#35443d"
+            self.canvas.create_rectangle(60, y1, 600, y2, fill=fill,
+                                         outline="#d4bd91" if index == self.customize_item
+                                         else "#b7a982", width=1, tags="frame")
+            if color:
+                self.canvas.create_oval(76, y1 + 17, 100, y1 + 41,
+                                        fill=color, outline="#d4bd91", tags="frame")
+            self.canvas.create_text(112, y1 + 20, text=name,
+                                    anchor="w", fill="#f0dfb8",
+                                    font=("Segoe UI", 11, "bold"), tags="frame")
+            if name in self.owned_cosmetics[category]:
+                status = "EQUIPPED" if name == self.equipped_cosmetics[category] else "EQUIP"
+            else:
+                status = f"BUY  {cost}"
+            self.canvas.create_text(575, y1 + 30, text=status,
+                                    anchor="e", fill="#e5c874",
+                                    font=("Segoe UI", 10, "bold"), tags="frame")
+
+        selected_name, selected_cost, _ = COSMETIC_ITEMS[category][self.customize_item]
+        preview_appearance = self.equipped_cosmetics.copy()
+        preview_appearance[category] = selected_name
+        self.canvas.create_text(770, 233, text="PREVIEW",
+                                fill="#d8c58f", font=("Segoe UI", 11, "bold"),
+                                tags="frame")
+        self.draw_entity(770, 340, 42, "#72a2ad", "#d5d9c0",
+                         (1, 0), "scout", preview_appearance)
+        self.canvas.create_text(770, 410, text=f"{category}: {selected_name}",
+                                width=290, fill="#e5c874",
+                                font=("Segoe UI", 10, "bold"), tags="frame")
+        equipped = ", ".join(
+            self.equipped_cosmetics[category] for category in categories
+        )
+        self.canvas.create_text(770, 435, text=f"Equipped: {equipped}", width=290,
+                                fill="#c2c7b9", font=("Segoe UI", 9),
+                                tags="frame")
+        if selected_name in self.owned_cosmetics[category]:
+            action_label = "EQUIPPED" if selected_name == self.equipped_cosmetics[category] else "EQUIP ITEM"
+        else:
+            action_label = f"BUY  {selected_cost} COINS"
+        self.canvas.create_rectangle(60, 505, 600, 545, fill="#53634d",
+                                     outline="#d4bd91", width=1, tags="frame")
+        self.canvas.create_text(330, 525, text=action_label,
+                                fill="#fff1d2", font=("Segoe UI", 11, "bold"),
+                                tags="frame")
+        self.canvas.create_rectangle(70, 550, 260, 600, fill="#53634d",
+                                     outline="#d4bd91", width=1, tags="frame")
+        self.canvas.create_text(165, 575, text="BACK TO PAUSE",
+                                fill="#fff1d2", font=("Segoe UI", 10, "bold"),
+                                tags="frame")
+        if time.monotonic() < self.message_until:
+            self.canvas.create_text(770, 470, text=self.message,
+                                    fill="#e5c874", font=("Segoe UI", 10, "bold"),
+                                    tags="frame")
+
+    def draw_paused(self):
+        self.canvas.create_rectangle(0, 0, WIDTH, HEIGHT, fill="#101718",
+                                     stipple="gray50", outline="", tags="frame")
+        self.canvas.create_text(WIDTH / 2, 220, text="PAUSED",
+                                fill="#e8d9b8", font=("Segoe UI", 31, "bold"),
+                                tags="frame")
+        self.canvas.create_text(WIDTH / 2, 276, text="The frontline is waiting.",
+                                fill="#c2c7b9", font=("Segoe UI", 12), tags="frame")
+        for y1, y2, label in ((320, 370, "RESUME  -  ESC"),
+                              (390, 440, "CHANGE CHARACTER  -  C")):
+            self.canvas.create_rectangle(370, y1, 590, y2, fill="#53634d",
+                                         outline="#d4bd91", width=1, tags="frame")
+            self.canvas.create_text(WIDTH / 2, (y1 + y2) / 2, text=label,
+                                    fill="#fff1d2", font=("Segoe UI", 11, "bold"),
+                                    tags="frame")
+
+    def draw_shop(self):
+        self.canvas.create_rectangle(0, 0, WIDTH, HEIGHT, fill="#101718",
+                                     stipple="gray50", outline="", tags="frame")
+        self.canvas.create_text(WIDTH / 2, 135, text="FIELD UPGRADES",
+                                fill="#f0d7c5", font=("Segoe UI", 28, "bold"),
+                                tags="frame")
+        self.canvas.create_text(WIDTH / 2, 180, text=f"AVAILABLE COINS: {self.coins}",
+                                fill="#e5c874", font=("Segoe UI", 15, "bold"),
+                                tags="frame")
+        rows = (
+            (self.weapon_upgrade, 15 + self.weapon_upgrade * 12,
+             "WEAPON DAMAGE", "Increase every shot's damage."),
+            (self.skill_upgrade, 25 + self.skill_upgrade * 15,
+             "BOSS SKILL POWER + AREA", "Make acquired skills stronger and wider."),
+            (self.health_upgrade, 20 + self.health_upgrade * 12,
+             "MAX HEALTH", "Gain 25 maximum HP and heal 25."),
+        )
+        for i, (level, cost, title, description) in enumerate(rows):
+            y = 220 + i * 72
+            self.canvas.create_rectangle(180, y, 780, y + 60, fill="#35443d",
+                                         outline="#b7a982", width=2, tags="frame")
+            self.canvas.create_text(205, y + 17, text=f"{title}  LV {level}",
+                                    anchor="w", fill="#f0dfb8",
+                                    font=("Segoe UI", 12, "bold"), tags="frame")
+            self.canvas.create_text(205, y + 42, text=description,
+                                    anchor="w", fill="#c2c7b9",
+                                    font=("Segoe UI", 9), tags="frame")
+            self.canvas.create_text(745, y + 30, text=f"BUY  {cost}",
+                                    anchor="e", fill="#e5c874",
+                                    font=("Segoe UI", 11, "bold"), tags="frame")
+        self.canvas.create_text(WIDTH / 2, 465, text="CLICK AN UPGRADE  |  ESC TO RETURN",
+                                fill="#d0d4c2", font=("Segoe UI", 11, "bold"),
+                                tags="frame")
+        if time.monotonic() < self.message_until:
+            self.canvas.create_text(WIDTH / 2, 500, text=self.message,
+                                    fill="#e5c874", font=("Segoe UI", 11, "bold"),
+                                    tags="frame")
+
+    def draw_region_map(self):
+        self.canvas.create_rectangle(0, 0, WIDTH, HEIGHT, fill="#101718",
+                                     stipple="gray50", outline="", tags="frame")
+        self.canvas.create_text(WIDTH / 2, 155, text="CHOOSE YOUR TERRAIN",
+                                fill="#f0d7c5", font=("Segoe UI", 27, "bold"),
+                                tags="frame")
+        self.canvas.create_text(WIDTH / 2, 205,
+                                text="Travel is always your choice. Click a region to move there.",
+                                fill="#c2c7b9", font=("Segoe UI", 11), tags="frame")
+        for i, region in enumerate(REGIONS):
+            col = i % 4
+            x1 = 70 + col * 210
+            x2 = x1 + 190
+            y1, y2 = 270, 395
+            color = region[1]
+            self.canvas.create_rectangle(x1, y1, x2, y2, fill=color,
+                                         outline="#d4bd91", width=2, tags="frame")
+            self.canvas.create_text((x1 + x2) / 2, y1 + 38, text=region[0],
+                                    fill="#fff1d2", font=("Segoe UI", 12, "bold"),
+                                    tags="frame")
+            status = "CURRENT" if i == self.region else (
+                "CLAIMED" if self.territories[i] else "UNCLAIMED"
+            )
+            self.canvas.create_text((x1 + x2) / 2, y1 + 82, text=status,
+                                    fill="#e5c874", font=("Segoe UI", 10, "bold"),
+                                    tags="frame")
+            self.canvas.create_text((x1 + x2) / 2, y2 - 18, text="CLICK TO TRAVEL",
+                                    fill="#f5eee0", font=("Segoe UI", 9), tags="frame")
+        self.canvas.create_text(WIDTH / 2, 450,
+                                text="ESC TO RETURN  |  M OPENS THIS MAP DURING BATTLES",
+                                fill="#d0d4c2", font=("Segoe UI", 11, "bold"),
+                                tags="frame")
 
     def draw_overlay(self, title, subtitle, action):
         self.canvas.create_rectangle(0, 0, WIDTH, HEIGHT, fill="#101718", stipple="gray50",
-                                     outline="")
+                                     outline="", tags="frame")
         self.canvas.create_text(WIDTH / 2, 220, text=title, fill="#e8d9b8",
-                                font=("Segoe UI", 31, "bold"))
+                                font=("Segoe UI", 31, "bold"), tags="frame")
         self.canvas.create_text(WIDTH / 2, 276, text=subtitle, fill="#c2c7b9",
-                                font=("Segoe UI", 12))
+                                font=("Segoe UI", 12), tags="frame")
         self.rect(WIDTH / 2 - 115, 331, WIDTH / 2 + 115, 381, "#a0784d", "#d4bd91")
         self.canvas.create_text(WIDTH / 2, 356, text=action, fill="#fff1d2",
-                                font=("Segoe UI", 13, "bold"))
+                                font=("Segoe UI", 13, "bold"), tags="frame")
         self.canvas.create_text(WIDTH / 2, 430,
-                                text="WASD / ARROWS  MOVE     SPACE  ATTACK     ESC  PAUSE",
-                                fill="#b7c1b4", font=("Segoe UI", 10, "bold"))
+                                text="WASD / ARROWS MOVE   SPACE / CLICK SHOOT   1 SKILL   2 CYCLE   ESC PAUSE",
+                                fill="#b7c1b4", font=("Segoe UI", 10, "bold"), tags="frame")
         self.canvas.create_text(WIDTH / 2, 461,
-                                text="Defeat raiders, earn XP, level up, and collect field medkits.",
-                                fill="#9ea99d", font=("Segoe UI", 10))
+                                text="Defeat the warlords, claim new territories, and take their power.",
+                                fill="#9ea99d", font=("Segoe UI", 10), tags="frame")
 
     def tick(self):
         now = time.monotonic()
         dt = min(now - self.last_tick, 0.05)
         self.last_tick = now
-        if self.state == "playing":
+        self.canvas.delete("frame")
+        self.update_flow(now)
+        if self.state == "tower_gate":
+            self.update_tower_gate(dt)
+        if self.state in ("playing", "boss_skill", "post_boss"):
             self.update(dt, now)
-        if self.state in ("playing", "paused", "gameover"):
+        if self.state in ("playing", "paused", "gameover", "region_map",
+                          "boss_cutscene", "boss_dialogue", "boss_skill",
+                          "minion_reveal", "kidnapper_reveal", "post_boss",
+                          "auto_aim_prompt"):
             self.draw_game(now)
         else:
-            self.canvas.delete("all")
-            self.draw_background()
-            self.draw_overlay("ASHEN FRONT", "A lone scout. An endless frontline.", "DEPLOY  -  ENTER")
-        if self.state == "paused":
-            self.draw_overlay("PAUSED", "The frontline is waiting.", "RESUME  -  ESC")
+            self.canvas.delete("frame")
+        if self.state == "menu":
+            self.draw_overlay(
+                "WELCOME TO THE GAME!",
+                "DEFEAT MONSTERS AND ENEMIES TO ACQUIRE SKILLS AND BECOME THE KING OF THE GAME!",
+                "DEPLOY  -  ENTER"
+            )
+        elif self.state == "tower_exterior":
+            self.draw_tower_exterior()
+        elif self.state == "opening_cutscene":
+            self.draw_opening_cutscene(now)
+        elif self.state == "tower_gate":
+            self.draw_tower_gate()
+            if now < self.message_until:
+                self.canvas.create_text(WIDTH / 2, HEIGHT - 48, text=self.message,
+                                        fill="#f0d99f",
+                                        font=("Segoe UI", 10, "bold"),
+                                        tags="frame")
+        elif self.state == "quest_select":
+            self.draw_quest_select()
+        elif self.state == "stage_intro":
+            self.draw_stage_intro()
+        elif self.state == "boss_warning":
+            self.draw_boss_warning(now)
+        elif self.state == "post_boss":
+            self.draw_post_boss(now)
+        elif self.state == "minion_reveal":
+            self.draw_minion_reveal(now)
+        elif self.state == "kidnapper_reveal":
+            self.draw_kidnapper_reveal(now)
+        elif self.state == "shop":
+            self.draw_shop()
+        elif self.state == "region_map":
+            self.draw_region_map()
+        elif self.state == "paused":
+            self.draw_paused()
+        elif self.state == "character":
+            self.draw_character_customization()
+        elif self.state == "auto_aim_prompt":
+            self.draw_auto_aim_prompt()
+        elif self.state == "cosmetic_chest":
+            self.draw_cosmetic_chest()
         elif self.state == "gameover":
             self.draw_overlay(f"FALLEN  -  WAVE {self.wave}",
                               f"You defeated {self.kills} enemies and reached level {self.player['level']}.",
                               "REDEPLOY  -  ENTER")
-        self.root.after(16, self.tick)
+        elif self.state == "victory":
+            self.draw_victory()
+        self.root.after(33, self.tick)
 
 
 if __name__ == "__main__":
