@@ -64,6 +64,17 @@ MILESTONE_BOSS_SKILLS = (
 ALL_BOSS_SKILLS = BOSS_SKILLS + MILESTONE_BOSS_SKILLS
 MAX_ABILITIES = 5
 TARGETED_SKILLS = frozenset(("Ice Stars", "Epic Fall"))
+SIDE_QUESTS = (
+    ("superhuman", "Become a Superhuman", "superhuman", 1, 25),
+    ("buy_weapon_1", "Buy 1 special weapon", "weapons_purchased", 1, 5),
+    ("obtain_skill_1", "Obtain 1 skill", "skills_obtained", 1, 4),
+    ("forge_skill_1", "Forge 1 skill", "skills_forged", 1, 7),
+    ("buy_weapon_5", "Buy 5 special weapons", "weapons_purchased", 5, 10),
+    ("obtain_skill_3", "Obtain 3 skills", "skills_obtained", 3, 7),
+    ("forge_skill_3", "Forge 3 skills", "skills_forged", 3, 12),
+    ("obtain_skill_7", "Obtain 7 skills", "skills_obtained", 7, 18),
+    ("forge_skill_10", "Forge 10 skills", "skills_forged", 10, 20),
+)
 SKILL_DAMAGE_RANGE = {
     "Groundsplit": (130, 320),
     "Frost Nova": (85, 235),
@@ -72,6 +83,15 @@ SKILL_DAMAGE_RANGE = {
     "Time Freeze": (100, 400),
     "Ice Stars": (310, 90),
     "Epic Fall": (175, 105),
+}
+FORGED_SKILL_NAMES = {
+    "Groundsplit": "Quake",
+    "Frost Nova": "Glacius",
+    "Ember Volley": "Pyro",
+    "Ironbark Guard": "Thorn",
+    "Time Freeze": "Chrono",
+    "Ice Stars": "Astral",
+    "Epic Fall": "Titan",
 }
 SAVE_VERSION = 1
 MINION_DIFFICULTIES = (
@@ -88,7 +108,7 @@ MARKET_WEAPONS = tuple(
         "name": f"{('Prism Lance', 'Frostfire Rocket', 'Starfall Bomb')[index % 3]} "
                 f"{index + 1:04d}",
         "type": ("LASER", "ROCKET", "ATOMIC")[index % 3],
-        "price": 5_000 + (index // 3) * 125,
+        "price": math.floor((5_000 + (index // 3) * 125) * 0.35 + 0.5),
     }
     for index in range(MARKET_WEAPON_COUNT)
 )
@@ -374,6 +394,10 @@ class BattlefieldRPG:
         self.market_page = 0
         self.market_filter = "ALL"
         self.market_search = ""
+        self.skill_market_page = 0
+        self.preview_weapon_id = None
+        self.weapon_test_started_at = 0
+        self.pending_purchase = None
         self.owned_special_weapons = []
         self.equipped_special_weapon = None
         self.special_shots_left = SPECIAL_SHOTS_PER_FLOOR
@@ -386,10 +410,26 @@ class BattlefieldRPG:
         self.forge_selected_skills = []
         self.forge_page = 0
         self.evolved = False
+        self.superhuman_active = False
+        self.superhuman_original_stats = None
+        self.superhuman_xp_earned = 0
+        self.forge_animation_started_at = 0
+        self.forge_animation_name = ""
+        self.quick_loadout_open = False
+        self.quick_loadout_page = 0
+        self.side_quests_return_state = "marketplace"
         self.last_autosave_at = time.monotonic()
         self.kills = 0
         self.floor_kills_start = 0
-        self.coins = 0
+        self.coins = 1_000
+        self.gems = 0
+        self.side_quest_stats = {
+            "weapons_purchased": 0,
+            "skills_obtained": 0,
+            "skills_forged": 0,
+            "superhuman": 0,
+        }
+        self.side_quests_claimed = set()
         self.auto_aim_enabled = False
         self.region = 0
         self.territories = [False] * len(REGIONS)
@@ -551,12 +591,22 @@ class BattlefieldRPG:
         return all(skill in self.unlocked_abilities for skill in ALL_BOSS_SKILLS)
 
     def player_radius(self):
-        return 20 if self.evolved else 15
+        return 20 if self.evolved or self.superhuman_active else 15
 
     def apply_evolution(self, save=True, heal=True):
-        if not self.has_all_boss_skills():
+        if self.superhuman_active or self.evolved or len(self.skill_copies) < 7:
             return False
-        self.evolved = True
+        self.superhuman_original_stats = {
+            **{
+                field: self.player[field]
+                for field in ("level", "xp", "next_xp", "speed", "max_hp", "hp")
+            },
+            "weapon_upgrade": self.weapon_upgrade,
+            "skill_upgrade": self.skill_upgrade,
+            "health_upgrade": self.health_upgrade,
+        }
+        self.superhuman_xp_earned = 0
+        self.superhuman_active = True
         self.player.update({
             "level": 100,
             "xp": 0,
@@ -567,11 +617,62 @@ class BattlefieldRPG:
         self.weapon_upgrade = 100
         self.skill_upgrade = 100
         self.health_upgrade = 100
-        self.message = "EVOLUTION COMPLETE  -  LEVEL 100 POWER AWAKENED"
+        self.track_side_quest_progress("superhuman")
+        self.message = "SUPERHUMAN AWAKENED  -  POWER LASTS UNTIL THE FLOOR BOSS FALLS"
         self.message_until = time.monotonic() + 4
         if save:
             self.save_game()
         return True
+
+    def end_superhuman(self, save=True):
+        if not self.superhuman_active:
+            return
+        original = self.superhuman_original_stats
+        if isinstance(original, dict):
+            for field in ("level", "xp", "next_xp", "speed", "max_hp", "hp"):
+                self.player[field] = original[field]
+            for field in ("weapon_upgrade", "skill_upgrade", "health_upgrade"):
+                setattr(self, field, original[field])
+            self.player["xp"] += self.superhuman_xp_earned
+        self.superhuman_active = False
+        self.superhuman_original_stats = None
+        self.superhuman_xp_earned = 0
+        if isinstance(original, dict):
+            self.check_level_up()
+        self.message = "FLOOR BOSS DEFEATED  -  SUPERHUMAN FORM ENDED"
+        self.message_until = time.monotonic() + 3
+        if save:
+            self.save_game()
+
+    @staticmethod
+    def gem_price(coin_price):
+        return max(1, math.ceil(coin_price / 1_000))
+
+    def track_side_quest_progress(self, counter, amount=1):
+        if counter not in self.side_quest_stats or amount <= 0:
+            return
+        self.side_quest_stats[counter] += amount
+        self.award_side_quests()
+
+    def award_side_quests(self, save=True):
+        newly_awarded = []
+        for quest_id, title, counter, target, reward in SIDE_QUESTS:
+            if (quest_id not in self.side_quests_claimed
+                    and self.side_quest_stats[counter] >= target):
+                self.side_quests_claimed.add(quest_id)
+                self.gems += reward
+                newly_awarded.append((title, reward))
+        if newly_awarded:
+            reward_total = sum(reward for _, reward in newly_awarded)
+            self.message = f"SIDE QUEST COMPLETE  +{reward_total} GEMS"
+            self.message_until = time.monotonic() + 3
+            if save:
+                self.save_game()
+
+    def open_side_quests(self, return_state):
+        self.quick_loadout_open = False
+        self.side_quests_return_state = return_state
+        self.state = "side_quests"
 
     def skill_damage_range(self, skill):
         if skill[0] in self.crafted_skill_data:
@@ -589,6 +690,124 @@ class BattlefieldRPG:
         self.forge_selected_skills = []
         self.forge_page = 0
         self.state = "skill_forge"
+
+    def open_skill_market(self):
+        self.skill_market_page = 0
+        self.state = "skill_market"
+
+    def request_market_purchase(self, kind, item_id, return_state):
+        if kind == "weapon":
+            if not isinstance(item_id, int) or not 0 <= item_id < len(MARKET_WEAPONS):
+                return
+            item = MARKET_WEAPONS[item_id]
+            name, price = item["name"], item["price"]
+            already_owned = item_id in self.owned_special_weapons
+        elif kind == "skill":
+            if not isinstance(item_id, int) or not 0 <= item_id < len(ALL_BOSS_SKILLS):
+                return
+            item = ALL_BOSS_SKILLS[item_id]
+            name, price = item[0], MARKET_WEAPONS[item_id]["price"]
+            already_owned = False
+        else:
+            return
+        if already_owned:
+            self.message = f"{name.upper()} IS ALREADY OWNED"
+            self.message_until = time.monotonic() + 2
+            return
+        if return_state not in ("skill_market", "weapon_preview"):
+            return
+        self.pending_purchase = {
+            "kind": kind,
+            "item_id": item_id,
+            "return_state": return_state,
+        }
+        self.state = "purchase_confirmation"
+
+    def complete_market_purchase(self, currency):
+        purchase = self.pending_purchase
+        if not isinstance(purchase, dict):
+            self.state = "marketplace"
+            return
+        kind, item_id = purchase.get("kind"), purchase.get("item_id")
+        details = self.pending_purchase_details()
+        if details is None or currency not in ("coins", "gems"):
+            self.message = "PURCHASE CANCELLED  -  ITEM OR PAYMENT IS UNAVAILABLE"
+            self.pending_purchase = None
+            self.state = purchase.get("return_state", "marketplace")
+            return
+        price = details[1]
+        cost = price if currency == "coins" else self.gem_price(price)
+        balance = self.coins if currency == "coins" else self.gems
+        if balance < cost:
+            self.message = (
+                f"NOT ENOUGH {currency.upper()}  -  NEED {cost:,}"
+            )
+            self.message_until = time.monotonic() + 2.5
+            return
+        if kind == "weapon" and isinstance(item_id, int) and 0 <= item_id < len(MARKET_WEAPONS):
+            weapon = MARKET_WEAPONS[item_id]
+            if item_id in self.owned_special_weapons:
+                self.message = "SPECIAL WEAPON IS ALREADY OWNED"
+            else:
+                if currency == "coins":
+                    self.coins -= cost
+                else:
+                    self.gems -= cost
+                self.owned_special_weapons.append(item_id)
+                self.track_side_quest_progress("weapons_purchased")
+                self.message = f'{weapon["name"].upper()} PURCHASED'
+                self.save_game()
+        elif kind == "skill" and isinstance(item_id, int) and 0 <= item_id < len(ALL_BOSS_SKILLS):
+            skill = ALL_BOSS_SKILLS[item_id]
+            if currency == "coins":
+                self.coins -= cost
+            else:
+                self.gems -= cost
+            if skill not in self.unlocked_abilities:
+                self.unlocked_abilities.append(skill)
+            self.skill_copies.append(skill)
+            if skill not in self.equipped_abilities and len(self.equipped_abilities) < MAX_ABILITIES:
+                self.equipped_abilities.append(skill)
+            self.has_boss_ability = bool(self.equipped_abilities)
+            self.ability_cooldowns.setdefault(skill[0], 0)
+            self.track_side_quest_progress("skills_obtained")
+            self.message = f"{skill[0].upper()} SKILL COPY PURCHASED"
+            self.save_game()
+        else:
+            self.message = "PURCHASE CANCELLED  -  ITEM IS UNAVAILABLE"
+        self.pending_purchase = None
+        self.state = purchase.get("return_state", "marketplace")
+        self.message_until = time.monotonic() + 2.5
+
+    def cancel_market_purchase(self):
+        purchase = self.pending_purchase
+        self.pending_purchase = None
+        self.state = (
+            purchase.get("return_state", "marketplace")
+            if isinstance(purchase, dict) else "marketplace"
+        )
+
+    def pending_purchase_details(self):
+        purchase = self.pending_purchase
+        if not isinstance(purchase, dict):
+            return None
+        kind, item_id = purchase.get("kind"), purchase.get("item_id")
+        if kind == "weapon" and isinstance(item_id, int) and 0 <= item_id < len(MARKET_WEAPONS):
+            item = MARKET_WEAPONS[item_id]
+            return item["name"], item["price"]
+        if kind == "skill" and isinstance(item_id, int) and 0 <= item_id < len(ALL_BOSS_SKILLS):
+            return ALL_BOSS_SKILLS[item_id][0], MARKET_WEAPONS[item_id]["price"]
+        return None
+
+    def buy_boss_skill(self, skill_index):
+        self.request_market_purchase("skill", skill_index, "skill_market")
+
+    def open_weapon_preview(self, weapon_id):
+        if not 0 <= weapon_id < len(MARKET_WEAPONS):
+            return
+        self.preview_weapon_id = weapon_id
+        self.weapon_test_started_at = 0
+        self.state = "weapon_preview"
 
     def craft_selected_skills(self):
         if len(self.forge_selected_skills) != 2:
@@ -613,7 +832,15 @@ class BattlefieldRPG:
         skill_range = sum(values[1] for values in damage_and_range)
         for ingredient in ingredients:
             self.skill_copies.remove(ingredient)
-        skill_name = f"Fusion {self.next_crafted_skill_id:03d}"
+        skill_name = "-".join(
+            FORGED_SKILL_NAMES[ingredient[0]] for ingredient in ingredients
+        )
+        base_name = skill_name
+        suffix = 2
+        while skill_name in self.crafted_skill_data or any(
+                skill[0] == skill_name for skill in self.unlocked_abilities):
+            skill_name = f"{base_name} {suffix}"
+            suffix += 1
         self.next_crafted_skill_id += 1
         crafted_skill = (
             skill_name,
@@ -623,6 +850,7 @@ class BattlefieldRPG:
         self.crafted_skill_data[skill_name] = {
             "damage": damage,
             "range": skill_range,
+            "crafted": True,
         }
         self.skill_copies.append(crafted_skill)
         self.unlocked_abilities.append(crafted_skill)
@@ -630,15 +858,27 @@ class BattlefieldRPG:
             self.equipped_abilities.append(crafted_skill)
         self.has_boss_ability = bool(self.equipped_abilities)
         self.ability_cooldowns.setdefault(skill_name, 0)
+        self.track_side_quest_progress("skills_forged")
+        self.track_side_quest_progress("skills_obtained")
         self.forge_selected_skills = []
+        self.forge_animation_started_at = time.monotonic()
+        self.forge_animation_name = skill_name
         self.message = (
             f"{skill_name.upper()} FORGED  -  {damage} DAMAGE / "
             f"{skill_range} RANGE"
         )
         self.message_until = time.monotonic() + 3
+        self.audio.speak(f"{skill_name} forged")
         self.save_game()
 
     def on_click(self, event):
+        if self.quick_loadout_open and self.state == "playing":
+            self.handle_quick_loadout_click(event.x, event.y)
+            return
+        if self.state == "side_quests":
+            if 50 <= event.x <= 250 and event.y >= 555:
+                self.state = self.side_quests_return_state
+            return
         if self.state == "menu":
             if 165 <= event.x <= 465 and 331 <= event.y <= 381:
                 if self.has_save():
@@ -727,6 +967,15 @@ class BattlefieldRPG:
             return
         if self.state == "marketplace":
             self.handle_market_click(event.x, event.y)
+            return
+        if self.state == "purchase_confirmation":
+            self.handle_purchase_confirmation_click(event.x, event.y)
+            return
+        elif self.state == "skill_market":
+            self.handle_skill_market_click(event.x, event.y)
+            return
+        elif self.state == "weapon_preview":
+            self.handle_weapon_preview_click(event.x, event.y)
             return
         elif self.state == "skill_forge":
             self.handle_skill_forge_click(event.x, event.y)
@@ -827,6 +1076,19 @@ class BattlefieldRPG:
             return
         was_down = key in self.keys
         self.keys.add(key)
+        if self.quick_loadout_open and key == "escape":
+            self.quick_loadout_open = False
+            self.keys.clear()
+            return
+        if key in ("grave", "asciitilde") and not was_down and self.state == "playing":
+            self.quick_loadout_open = not self.quick_loadout_open
+            self.quick_loadout_page = 0
+            return
+        if key == "q" and not was_down and self.state in (
+                "playing", "paused", "floor_progression", "marketplace",
+                "skill_market", "skill_forge"):
+            self.open_side_quests(self.state)
+            return
         if key in ("return", "space") and self.state == "menu":
             self.load_game() if self.has_save() else self.start_game()
         elif key in ("return", "space") and self.state == "gameover":
@@ -834,16 +1096,16 @@ class BattlefieldRPG:
         elif key in ("1", "2", "3", "4", "5") and not was_down and self.state == "playing":
             self.use_boss_ability(time.monotonic(), int(key) - 1)
         elif key == "t" and not was_down and self.state in ("playing", "post_boss"):
-            if self.evolved:
-                self.message = "EVOLUTION POWER IS ALREADY AWAKENED"
+            if self.evolved or self.superhuman_active:
+                self.message = "SUPERHUMAN POWER IS ALREADY AWAKENED"
                 self.message_until = time.monotonic() + 2
             elif self.apply_evolution():
-                self.message = "EVOLUTION COMPLETE  -  LEVEL 100 POWER AWAKENED"
+                self.message = "SUPERHUMAN AWAKENED  -  LEVEL 100 POWER"
                 self.message_until = time.monotonic() + 4
             else:
                 self.message = (
-                    f"EVOLUTION LOCKED  -  LEARN ALL 7 SKILLS "
-                    f"({sum(skill in self.unlocked_abilities for skill in ALL_BOSS_SKILLS)}/7)"
+                    f"SUPERHUMAN LOCKED  -  COLLECT 7 SKILL COPIES "
+                    f"({len(self.skill_copies)}/7)"
                 )
                 self.message_until = time.monotonic() + 2.5
         elif key in ("1", "2", "3") and not was_down and self.state == "minion_difficulty":
@@ -866,6 +1128,10 @@ class BattlefieldRPG:
                 self.state = "floor_progression"
         elif self.state == "skill_forge" and key == "escape":
             self.state = "marketplace"
+        elif self.state in ("skill_market", "weapon_preview") and key == "escape":
+            self.state = "marketplace"
+        elif self.state == "purchase_confirmation" and key == "escape":
+            self.cancel_market_purchase()
         elif self.state == "marketplace" and len(key) == 1 and key.isprintable():
             self.market_search += key
         elif key == "b" and not was_down and self.state == "post_boss":
@@ -898,6 +1164,12 @@ class BattlefieldRPG:
                 self.state = "floor_progression"
             elif self.state == "skill_forge":
                 self.state = "marketplace"
+            elif self.state in ("skill_market", "weapon_preview"):
+                self.state = "marketplace"
+            elif self.state == "purchase_confirmation":
+                self.cancel_market_purchase()
+            elif self.state == "side_quests":
+                self.state = self.side_quests_return_state
             elif self.state == "special_loadout":
                 self.state = self.special_loadout_return_state
             elif self.state == "character":
@@ -952,6 +1224,9 @@ class BattlefieldRPG:
             "progression_return_state": self.progression_return_state,
             "player": {field: self.player[field] for field in player_fields},
             "coins": self.coins,
+            "gems": self.gems,
+            "side_quest_stats": self.side_quest_stats,
+            "side_quests_claimed": sorted(self.side_quests_claimed),
             "kills": self.kills,
             "region": self.region,
             "territories": self.territories,
@@ -961,6 +1236,9 @@ class BattlefieldRPG:
             "crafted_skill_data": self.crafted_skill_data,
             "next_crafted_skill_id": self.next_crafted_skill_id,
             "evolved": self.evolved,
+            "superhuman_active": self.superhuman_active,
+            "superhuman_original_stats": self.superhuman_original_stats,
+            "superhuman_xp_earned": self.superhuman_xp_earned,
             "active_ability": self.active_ability,
             "weapon_upgrade": self.weapon_upgrade,
             "skill_upgrade": self.skill_upgrade,
@@ -1029,6 +1307,53 @@ class BattlefieldRPG:
             region = int(data["region"])
             if coins < 0 or kills < 0 or not 0 <= region < len(REGIONS):
                 raise ValueError("Invalid saved progress")
+            gems = int(data.get("gems", 0))
+            if gems < 0:
+                raise ValueError("Invalid gem balance")
+            saved_side_quest_stats = data.get("side_quest_stats", {})
+            if not isinstance(saved_side_quest_stats, dict):
+                raise ValueError("Invalid side quest progress")
+            side_quest_stats = {
+                counter: max(0, int(saved_side_quest_stats.get(counter, 0)))
+                for counter in (
+                    "weapons_purchased", "skills_obtained",
+                    "skills_forged", "superhuman",
+                )
+            }
+            valid_side_quest_ids = {quest[0] for quest in SIDE_QUESTS}
+            saved_side_quests_claimed = data.get("side_quests_claimed", [])
+            if not isinstance(saved_side_quests_claimed, list):
+                raise ValueError("Invalid claimed side quests")
+            side_quests_claimed = {
+                quest_id for quest_id in saved_side_quests_claimed
+                if isinstance(quest_id, str) and quest_id in valid_side_quest_ids
+            }
+            original_stats_data = data.get("superhuman_original_stats")
+            superhuman_original_stats = None
+            if original_stats_data is not None:
+                expected_stats = (
+                    "level", "xp", "next_xp", "speed", "max_hp", "hp",
+                    "weapon_upgrade", "skill_upgrade", "health_upgrade",
+                )
+                if (not isinstance(original_stats_data, dict)
+                        or any(not isinstance(original_stats_data.get(field), int)
+                               or original_stats_data[field] < 0
+                               for field in expected_stats)
+                        or original_stats_data["max_hp"] < 1
+                        or original_stats_data["next_xp"] < 1):
+                    raise ValueError("Invalid saved Superhuman state")
+                superhuman_original_stats = {
+                    field: original_stats_data[field] for field in expected_stats
+                }
+            superhuman_xp_earned = max(
+                0, int(data.get("superhuman_xp_earned", 0))
+            )
+            superhuman_active = (
+                bool(data.get("superhuman_active", False))
+                and superhuman_original_stats is not None
+            )
+            if bool(data.get("superhuman_active", False)) and not superhuman_active:
+                raise ValueError("Missing saved Superhuman restoration state")
             territories = data["territories"]
             if (not isinstance(territories, list)
                     or len(territories) != len(REGIONS)
@@ -1041,15 +1366,18 @@ class BattlefieldRPG:
                 raise ValueError("Invalid crafted skills")
             valid_crafted_skill_data = {}
             for name, metadata in crafted_skill_data.items():
-                if (isinstance(name, str) and name.startswith("Fusion ")
+                if (isinstance(name, str)
                         and isinstance(metadata, dict)
                         and isinstance(metadata.get("damage"), int)
                         and metadata["damage"] > 0
                         and isinstance(metadata.get("range"), int)
-                        and metadata["range"] > 0):
+                        and metadata["range"] > 0
+                        and (metadata.get("crafted") is True
+                             or name.startswith("Fusion "))):
                     valid_crafted_skill_data[name] = {
                         "damage": metadata["damage"],
                         "range": metadata["range"],
+                        "crafted": True,
                     }
             if not isinstance(data["unlocked_abilities"], list):
                 raise ValueError("Invalid saved skills")
@@ -1141,6 +1469,9 @@ class BattlefieldRPG:
             self.new_game()
             self.player.update(restored_player)
             self.coins = coins
+            self.gems = gems
+            self.side_quest_stats = side_quest_stats
+            self.side_quests_claimed = side_quests_claimed
             self.kills = kills
             self.floor_kills_start = max(
                 0, min(int(data.get("floor_kills_start", kills)), kills)
@@ -1155,13 +1486,29 @@ class BattlefieldRPG:
                 1, int(data.get("next_crafted_skill_id", 1))
             )
             self.evolved = bool(data.get("evolved", False))
+            self.superhuman_active = superhuman_active
+            self.superhuman_original_stats = (
+                superhuman_original_stats if superhuman_active else None
+            )
+            self.superhuman_xp_earned = (
+                superhuman_xp_earned if superhuman_active else 0
+            )
             self.has_boss_ability = bool(equipped_abilities)
             self.active_ability = active_ability
             for field, value in upgrades.items():
                 setattr(self, field, value)
             if self.evolved and self.has_all_boss_skills():
-                self.apply_evolution(save=False, heal=False)
-            else:
+                self.player.update({
+                    "level": 100,
+                    "xp": 0,
+                    "next_xp": 40,
+                    "max_hp": 100_000,
+                    "hp": min(self.player["hp"], 100_000),
+                })
+                self.weapon_upgrade = 100
+                self.skill_upgrade = 100
+                self.health_upgrade = 100
+            elif self.evolved:
                 self.evolved = False
             self.boss_weapon_owned = bool(data["boss_weapon_owned"])
             self.advanced_gun_owned = bool(data["advanced_gun_owned"])
@@ -1175,6 +1522,8 @@ class BattlefieldRPG:
                 1, min(int(data.get("floor_wave", 1)), self.floor_wave_count(floor))
             )
             self.encounter_clear = bool(data.get("encounter_clear", False))
+            if self.encounter_clear and self.superhuman_active:
+                self.end_superhuman(save=False)
             replay_active = bool(data.get("replay_active", False))
             replay_snapshot = data.get("replay_return_snapshot")
             if replay_active and not isinstance(replay_snapshot, dict):
@@ -1242,6 +1591,7 @@ class BattlefieldRPG:
                 self.active_quest = None
                 self.state = "quest_select"
             self.keys.clear()
+            self.award_side_quests(save=False)
             self.save_game()
             self.canvas.delete("background")
             self.draw_background()
@@ -1420,7 +1770,7 @@ class BattlefieldRPG:
                 "max_hp": base_hp,
                 "speed": 36 if is_minion_boss else 42,
                 "damage": 8 if is_minion_boss else 15,
-                "xp": 100,
+                "xp": 1_000 + floor * 250,
                 "radius": 30,
                 "kind": kind,
                 "attack_ready": 0,
@@ -1539,6 +1889,7 @@ class BattlefieldRPG:
         self.save_game()
 
     def open_floor_progression(self, return_state=None):
+        self.quick_loadout_open = False
         if return_state is not None:
             self.progression_return_state = return_state
         self.progression_selected_floor = self.stage_number()
@@ -1549,10 +1900,7 @@ class BattlefieldRPG:
         return self.floor_records.get(str(floor))
 
     def market_stand_unlocked(self, floor):
-        record = self.floor_record(floor)
-        return floor % 10 == 0 and record is not None and record.get(
-            "quest_index", -1
-        ) >= 1
+        return self.player["level"] >= 15
 
     def record_floor_clear(self):
         floor = self.stage_number()
@@ -1672,6 +2020,42 @@ class BattlefieldRPG:
             elif x >= 750:
                 self.forge_selected_skills = []
 
+    def handle_skill_market_click(self, x, y):
+        if y >= 555 and x <= 250:
+            self.state = "marketplace"
+            return
+        if 125 <= y < 545 and 52 <= x <= 910:
+            row = (y - 125) // 58
+            index = self.skill_market_page * 7 + row
+            if 0 <= index < len(ALL_BOSS_SKILLS):
+                self.buy_boss_skill(index)
+
+    def handle_weapon_preview_click(self, x, y):
+        if 535 <= y <= 595:
+            if x <= 245:
+                self.state = "marketplace"
+            elif 270 <= x <= 505:
+                self.weapon_test_started_at = time.monotonic()
+            elif x >= 530 and self.preview_weapon_id is not None:
+                self.request_market_purchase(
+                    "weapon", self.preview_weapon_id, "weapon_preview"
+                )
+
+    def handle_purchase_confirmation_click(self, x, y):
+        if 410 <= y <= 480:
+            details = self.pending_purchase_details()
+            if not details:
+                self.cancel_market_purchase()
+            elif 120 <= x <= 365:
+                if self.coins >= details[1]:
+                    self.complete_market_purchase("coins")
+            elif 380 <= x <= 600:
+                gem_cost = self.gem_price(details[1])
+                if self.gems >= gem_cost:
+                    self.complete_market_purchase("gems")
+            elif 615 <= x <= 840:
+                self.cancel_market_purchase()
+
     def open_special_loadout(self, return_state):
         self.special_loadout_return_state = return_state
         self.special_loadout_page = 0
@@ -1738,6 +2122,128 @@ class BattlefieldRPG:
         self.message_until = time.monotonic() + 2
         self.save_game()
 
+    def handle_quick_loadout_click(self, x, y):
+        if y >= 505 and 680 <= x <= 790:
+            self.quick_loadout_open = False
+            return
+        if 125 <= y <= 160:
+            if 180 <= x <= 390:
+                self.special_loadout_tab = "weapons"
+                self.quick_loadout_page = 0
+            elif 420 <= x <= 630:
+                self.special_loadout_tab = "skills"
+                self.quick_loadout_page = 0
+            return
+        if y >= 505:
+            if 300 <= x <= 420:
+                self.quick_loadout_page = max(0, self.quick_loadout_page - 1)
+            elif 540 <= x <= 660:
+                self.quick_loadout_page += 1
+            return
+        if not (175 <= y < 495 and 170 <= x <= 790):
+            return
+        row = (y - 175) // 40
+        index = self.quick_loadout_page * 8 + row
+        if self.special_loadout_tab == "skills":
+            if index < len(self.unlocked_abilities):
+                self.toggle_equipped_skill(self.unlocked_abilities[index])
+        else:
+            owned = self.owned_special_weapons
+            if index < len(owned):
+                weapon_id = owned[index]
+                self.equipped_special_weapon = weapon_id
+                self.message = f'{MARKET_WEAPONS[weapon_id]["name"].upper()} EQUIPPED'
+                self.message_until = time.monotonic() + 2
+                self.save_game()
+
+    def draw_quick_loadout(self):
+        c = self.canvas
+        c.create_rectangle(0, 0, WIDTH, HEIGHT, fill="#080b10",
+                           stipple="gray50", outline="", tags="frame")
+        c.create_rectangle(135, 85, 825, 565, fill="#202a27",
+                           outline="#d4bd91", width=2, tags="frame")
+        c.create_text(WIDTH / 2, 108, text="QUICK LOADOUT",
+                      fill="#f0d7c5", font=("Segoe UI", 19, "bold"), tags="frame")
+        for x1, x2, label, tab in (
+                (180, 390, "SPECIAL WEAPONS", "weapons"),
+                (420, 630, "BOSS SKILLS", "skills")):
+            selected = self.special_loadout_tab == tab
+            c.create_rectangle(x1, 125, x2, 160,
+                               fill="#53634d" if selected else "#35443d",
+                               outline="#d4bd91", tags="frame")
+            c.create_text((x1 + x2) / 2, 142, text=label,
+                          fill="#fff1d2", font=("Segoe UI", 9, "bold"),
+                          tags="frame")
+        if self.special_loadout_tab == "skills":
+            items = self.unlocked_abilities
+            pages = max(1, (len(items) + 7) // 8)
+            equipped_names = {skill[0] for skill in self.equipped_abilities}
+            page_items = items[self.quick_loadout_page * 8:
+                               self.quick_loadout_page * 8 + 8]
+            for row, skill in enumerate(page_items):
+                y = 175 + row * 40
+                equipped = skill in self.equipped_abilities
+                c.create_rectangle(170, y, 790, y + 34,
+                                   fill="#46523e" if equipped else "#29332f",
+                                   outline="#e5c874" if equipped else "#69766b",
+                                   tags="frame")
+                c.create_text(190, y + 17, anchor="w", text=skill[0],
+                              fill="#f0d7c5", font=("Segoe UI", 9, "bold"),
+                              tags="frame")
+                c.create_text(770, y + 17, anchor="e",
+                              text="EQUIPPED" if skill[0] in equipped_names else "CLICK TO EQUIP",
+                              fill="#e5c874", font=("Segoe UI", 8, "bold"),
+                              tags="frame")
+            if not items:
+                c.create_text(WIDTH / 2, 300, text="NO BOSS SKILLS OWNED",
+                              fill="#c2c7b9", font=("Segoe UI", 11, "bold"),
+                              tags="frame")
+        else:
+            items = self.owned_special_weapons
+            pages = max(1, (len(items) + 7) // 8)
+            page_items = items[self.quick_loadout_page * 8:
+                               self.quick_loadout_page * 8 + 8]
+            for row, weapon_id in enumerate(page_items):
+                weapon = MARKET_WEAPONS[weapon_id]
+                y = 175 + row * 40
+                equipped = weapon_id == self.equipped_special_weapon
+                c.create_rectangle(170, y, 790, y + 34,
+                                   fill="#46523e" if equipped else "#29332f",
+                                   outline="#e5c874" if equipped else "#69766b",
+                                   tags="frame")
+                c.create_text(190, y + 17, anchor="w",
+                              text=f'{weapon["name"]} [{weapon["type"]}]',
+                              fill="#f0d7c5", font=("Segoe UI", 9, "bold"),
+                              tags="frame")
+                c.create_text(770, y + 17, anchor="e",
+                              text="EQUIPPED" if equipped else "CLICK TO EQUIP",
+                              fill="#e5c874", font=("Segoe UI", 8, "bold"),
+                              tags="frame")
+            if not items:
+                c.create_text(WIDTH / 2, 300, text="NO SPECIAL WEAPONS OWNED",
+                              fill="#c2c7b9", font=("Segoe UI", 11, "bold"),
+                              tags="frame")
+        self.quick_loadout_page = min(self.quick_loadout_page, pages - 1)
+        c.create_rectangle(300, 505, 420, 545, fill="#35443d",
+                           outline="#d4bd91", tags="frame")
+        c.create_text(360, 525, text="◀ PREVIOUS",
+                      fill="#fff1d2", font=("Segoe UI", 8, "bold"),
+                      tags="frame")
+        c.create_text(WIDTH / 2, 525,
+                      text=f"PAGE {self.quick_loadout_page + 1}/{pages}  |  PRESS ` OR ESC TO CLOSE",
+                      fill="#c2c7b9", font=("Segoe UI", 8, "bold"),
+                      tags="frame")
+        c.create_rectangle(540, 505, 660, 545, fill="#35443d",
+                           outline="#d4bd91", tags="frame")
+        c.create_text(600, 525, text="NEXT ▶",
+                      fill="#fff1d2", font=("Segoe UI", 8, "bold"),
+                      tags="frame")
+        c.create_rectangle(680, 505, 790, 545, fill="#53634d",
+                           outline="#d4bd91", tags="frame")
+        c.create_text(735, 525, text="CLOSE",
+                      fill="#fff1d2", font=("Segoe UI", 9, "bold"),
+                      tags="frame")
+
     def handle_progression_click(self, x, y):
         if y < 112 and 300 <= x <= 430:
             self.advance_progression_page(-1)
@@ -1781,8 +2287,14 @@ class BattlefieldRPG:
         return weapons
 
     def handle_market_click(self, x, y):
+        if 410 <= x <= 570 and 50 <= y <= 100:
+            self.open_side_quests("marketplace")
+            return
         if 760 <= x <= 915 and 50 <= y <= 100:
             self.open_skill_forge()
+            return
+        if 585 <= x <= 745 and 50 <= y <= 100:
+            self.open_skill_market()
             return
         if y >= 570 and x <= 180:
             self.state = "floor_progression"
@@ -1800,22 +2312,12 @@ class BattlefieldRPG:
         if y >= 570 and 570 <= x <= 740:
             self.market_page += 1
             return
-        if 125 <= y < 565 and 52 <= x <= 910:
+        if 125 <= y <= 546 and 52 <= x <= 910:
             row = (y - 125) // 43
             visible = self.visible_market_weapons()
             index = self.market_page * 10 + row
-            if 0 <= index < len(visible):
-                weapon = visible[index]
-                if weapon["id"] in self.owned_special_weapons:
-                    self.message = "OPEN SPECIAL WEAPONS TO EQUIP OWNED ITEMS"
-                elif self.coins >= weapon["price"]:
-                    self.coins -= weapon["price"]
-                    self.owned_special_weapons.append(weapon["id"])
-                    self.message = f'{weapon["name"].upper()} PURCHASED  -  EQUIP IN SPECIAL WEAPONS'
-                else:
-                    self.message = f'NOT ENOUGH COINS  -  NEED {weapon["price"]:,}'
-                self.message_until = time.monotonic() + 2
-                self.save_game()
+            if 0 <= row < 10 and 0 <= index < len(visible):
+                self.open_weapon_preview(visible[index]["id"])
 
     def fire_special_weapon(self, now, fx, fy):
         if self.special_shots_left <= 0 or self.equipped_special_weapon is None:
@@ -2046,6 +2548,7 @@ class BattlefieldRPG:
         if skill not in self.unlocked_abilities:
             self.unlocked_abilities.append(skill)
         self.skill_copies.append(skill)
+        self.track_side_quest_progress("skills_obtained")
         if skill not in self.equipped_abilities and len(self.equipped_abilities) < MAX_ABILITIES:
             self.equipped_abilities.append(skill)
         self.has_boss_ability = bool(self.equipped_abilities)
@@ -2404,9 +2907,13 @@ class BattlefieldRPG:
         self.enemies.remove(enemy)
         self.audio.play("kill")
         self.kills += 1
-        self.player["xp"] += enemy["xp"]
+        if self.superhuman_active:
+            self.superhuman_xp_earned += enemy["xp"]
+        else:
+            self.player["xp"] += enemy["xp"]
         quest_just_completed = False
         minion_coin_reward = None
+        end_superhuman_after_boss = False
         if self.active_quest and not self.quest_complete:
             self.quest_progress += 1
             if self.quest_progress >= self.active_quest[2]:
@@ -2423,6 +2930,7 @@ class BattlefieldRPG:
                 "floor_final_boss",
                 enemy["kind"] != "minion_boss",
             )
+            end_superhuman_after_boss = is_final_boss
             if enemy["kind"] == "minion_boss":
                 difficulty = enemy.get("difficulty", self.minion_difficulty or 0)
                 reward = MINION_DIFFICULTIES[difficulty][2]
@@ -2501,6 +3009,8 @@ class BattlefieldRPG:
         self.effects.append({"kind": "burst", "x": enemy["x"], "y": enemy["y"],
                              "until": now + 0.3})
         self.check_level_up()
+        if end_superhuman_after_boss:
+            self.end_superhuman(save=False)
         if minion_coin_reward is not None:
             self.message = f"DEMON MINION DEFEATED  +{minion_coin_reward:,} COINS"
             self.message_until = now + 3
@@ -2602,6 +3112,12 @@ class BattlefieldRPG:
                 "kind": "time_freeze", "x": p["x"], "y": p["y"],
                 "until": self.time_freeze_until,
             })
+            for enemy in self.enemies[:]:
+                damage = max(1, math.floor(enemy["max_hp"] * 0.0199 + 0.5))
+                enemy["hp"] -= damage
+                enemy["hurt_until"] = now + 0.2
+                if enemy["hp"] <= 0:
+                    self.defeat_enemy(enemy, now)
         elif skill_name == "Ice Stars":
             self.spawn_ice_stars(
                 target_x, target_y, now, p, damage=int(62 * power),
@@ -2733,6 +3249,8 @@ class BattlefieldRPG:
         self.player["y"] = max(ARENA[1] + 20, min(ARENA[3] - 20, self.player["y"]))
 
     def check_level_up(self):
+        if self.superhuman_active:
+            return
         p = self.player
         leveled_up = False
         while p["xp"] >= p["next_xp"]:
@@ -3138,7 +3656,7 @@ class BattlefieldRPG:
                            fill="#53634d" if unlocked else "#202624",
                            outline="#d4bd91", tags="frame")
         c.create_text(475, 576,
-                      text="MARKETPLACE" if unlocked else "MARKET: CLEAR 10TH FLOOR",
+                      text="MARKETPLACE" if unlocked else "MARKET: REACH LV 15",
                       fill="#fff1d2" if unlocked else "#7a817b",
                       font=("Segoe UI", 8, "bold"), tags="frame")
         next_allowed = (
@@ -3178,13 +3696,26 @@ class BattlefieldRPG:
         c.create_rectangle(0, 0, WIDTH, HEIGHT, fill="#101718", tags="frame")
         c.create_text(WIDTH / 2, 38, text="SPECIAL WEAPON MARKET",
                       fill="#f0d7c5", font=("Segoe UI", 25, "bold"), tags="frame")
-        c.create_text(WIDTH / 2, 76,
-                      text=f"COINS {self.coins:,}  |  1,000 GENERATED WEAPONS  |  SEARCH: {self.market_search or '—'}",
+        c.create_text(52, 76, anchor="w",
+                      text=f"COINS {self.coins:,}  |  GEMS {self.gems}",
                       fill="#e5c874", font=("Segoe UI", 10, "bold"), tags="frame")
+        c.create_text(52, 96, anchor="w",
+                      text=f"SEARCH: {self.market_search or 'TYPE TO SEARCH'}",
+                      fill="#c2c7b9", font=("Segoe UI", 8, "bold"), tags="frame")
+        c.create_rectangle(410, 50, 570, 100, fill="#53634d",
+                           outline="#d4bd91", tags="frame")
+        c.create_text(490, 75, text="SIDE QUESTS",
+                      fill="#fff1d2", font=("Segoe UI", 10, "bold"),
+                      tags="frame")
         c.create_rectangle(760, 50, 915, 100, fill="#53634d",
                            outline="#d4bd91", tags="frame")
         c.create_text(837, 75, text="SKILL FORGE",
                       fill="#fff1d2", font=("Segoe UI", 10, "bold"),
+                      tags="frame")
+        c.create_rectangle(585, 50, 745, 100, fill="#53634d",
+                           outline="#d4bd91", tags="frame")
+        c.create_text(665, 75, text="SKILL MARKET",
+                      fill="#fff1d2", font=("Segoe UI", 9, "bold"),
                       tags="frame")
         visible = self.visible_market_weapons()
         pages = max(1, (len(visible) + 9) // 10)
@@ -3196,7 +3727,8 @@ class BattlefieldRPG:
             status = (
                 "EQUIPPED" if equipped
                 else ("OWNED - EQUIP IN SPECIAL WEAPONS" if owned
-                      else f"BUY {weapon['price']:,}")
+                      else (f"BUY {weapon['price']:,} COINS / "
+                            f"{self.gem_price(weapon['price'])} GEMS"))
             )
             c.create_rectangle(52, y, 908, y + 37, fill="#29332f",
                                outline="#69766b", tags="frame")
@@ -3205,6 +3737,8 @@ class BattlefieldRPG:
                           fill="#f0d7c5", font=("Segoe UI", 9, "bold"), tags="frame")
             c.create_text(885, y + 18, anchor="e", text=status,
                           fill="#e5c874", font=("Segoe UI", 9, "bold"), tags="frame")
+            c.create_text(610, y + 18, anchor="e", text="CLICK TO VIEW / TEST",
+                          fill="#8ee5f0", font=("Segoe UI", 8, "bold"), tags="frame")
         controls = ((40, "BACK"), (210, f"TYPE: {self.market_filter}"),
                     (390, "TYPE TO SEARCH"), (570, "NEXT PAGE ▶"),
                     (760, "◀ PREVIOUS"))
@@ -3216,6 +3750,245 @@ class BattlefieldRPG:
         c.create_text(WIDTH / 2, 626,
                       text="LASER: PIERCING BEAM  |  ROCKET: AREA BLAST  |  ATOMIC: HALF-MAP BLAST  |  3 SHOTS PER FLOOR",
                       fill="#c2c7b9", font=("Segoe UI", 8, "bold"), tags="frame")
+
+    def draw_skill_market(self):
+        c = self.canvas
+        c.create_rectangle(0, 0, WIDTH, HEIGHT, fill="#101718", tags="frame")
+        c.create_text(WIDTH / 2, 42, text="SKILL MARKET",
+                      fill="#f0d7c5", font=("Segoe UI", 27, "bold"), tags="frame")
+        c.create_text(
+            WIDTH / 2, 82,
+            text=f"COINS: {self.coins:,}  |  GEMS: {self.gems}  |  1 GEM = 1,000 COINS (ROUNDED UP)",
+            fill="#e5c874", font=("Segoe UI", 10, "bold"), tags="frame"
+        )
+        for index, skill in enumerate(ALL_BOSS_SKILLS):
+            y = 125 + index * 58
+            price = MARKET_WEAPONS[index]["price"]
+            copies = sum(copy[0] == skill[0] for copy in self.skill_copies)
+            c.create_rectangle(
+                52, y, 908, y + 48,
+                fill="#46523e" if skill in self.unlocked_abilities else "#29332f",
+                outline="#e5c874" if skill in self.unlocked_abilities else "#69766b",
+                width=2 if skill in self.unlocked_abilities else 1, tags="frame"
+            )
+            c.create_text(72, y + 15, anchor="w", text=skill[0],
+                          fill="#f0d7c5", font=("Segoe UI", 10, "bold"),
+                          tags="frame")
+            c.create_text(72, y + 34, anchor="w", text=skill[2],
+                          fill="#c2c7b9", font=("Segoe UI", 8), tags="frame")
+            c.create_text(
+                885, y + 24, anchor="e",
+                text=(f"BUY COPY  {price:,} COINS / "
+                      f"{self.gem_price(price)} GEMS  |  COPIES: {copies}"),
+                fill="#e5c874", font=("Segoe UI", 9, "bold"), tags="frame"
+            )
+        c.create_rectangle(50, 555, 250, 600, fill="#35443d",
+                           outline="#d4bd91", tags="frame")
+        c.create_text(150, 577, text="BACK TO WEAPON MARKET",
+                      fill="#fff1d2", font=("Segoe UI", 9, "bold"), tags="frame")
+        if time.monotonic() < self.message_until:
+            c.create_text(WIDTH / 2, 535, text=self.message,
+                          fill="#e5c874", font=("Segoe UI", 10, "bold"),
+                          tags="frame")
+
+    def draw_side_quests(self):
+        c = self.canvas
+        c.create_rectangle(0, 0, WIDTH, HEIGHT, fill="#101718", tags="frame")
+        c.create_text(WIDTH / 2, 38, text="SIDE QUESTS",
+                      fill="#f0d7c5", font=("Segoe UI", 25, "bold"), tags="frame")
+        c.create_text(WIDTH / 2, 76,
+                      text=f"GEMS: {self.gems}  |  NO TIME LIMIT  |  REWARDS ARE PAID AUTOMATICALLY",
+                      fill="#e5c874", font=("Segoe UI", 10, "bold"), tags="frame")
+        for index, (quest_id, title, counter, target, reward) in enumerate(SIDE_QUESTS):
+            y = 105 + index * 49
+            progress = min(target, self.side_quest_stats[counter])
+            completed = quest_id in self.side_quests_claimed
+            c.create_rectangle(
+                70, y, 890, y + 42,
+                fill="#35443d" if completed else "#29332f",
+                outline="#a5d46d" if completed else "#69766b",
+                width=2 if completed else 1, tags="frame"
+            )
+            c.create_text(92, y + 21, anchor="w", text=title,
+                          fill="#f0d7c5", font=("Segoe UI", 10, "bold"),
+                          tags="frame")
+            c.create_text(
+                650, y + 21, anchor="e",
+                text=("COMPLETE" if completed else f"{progress}/{target}"),
+                fill="#a5d46d" if completed else "#c2c7b9",
+                font=("Segoe UI", 9, "bold"), tags="frame"
+            )
+            c.create_text(860, y + 21, anchor="e", text=f"+{reward} GEMS",
+                          fill="#e5c874", font=("Segoe UI", 9, "bold"),
+                          tags="frame")
+        c.create_rectangle(50, 555, 250, 600, fill="#35443d",
+                           outline="#d4bd91", tags="frame")
+        c.create_text(150, 577, text="BACK",
+                      fill="#fff1d2", font=("Segoe UI", 10, "bold"),
+                      tags="frame")
+
+    def draw_weapon_preview(self):
+        if self.preview_weapon_id is None:
+            self.state = "marketplace"
+            return
+        c = self.canvas
+        weapon = MARKET_WEAPONS[self.preview_weapon_id]
+        now = time.monotonic()
+        elapsed = now - self.weapon_test_started_at if self.weapon_test_started_at else -1
+        c.create_rectangle(0, 0, WIDTH, HEIGHT, fill="#101718", tags="frame")
+        c.create_text(WIDTH / 2, 48, text="SPECIAL WEAPON PREVIEW",
+                      fill="#f0d7c5", font=("Segoe UI", 24, "bold"), tags="frame")
+        c.create_text(
+            WIDTH / 2, 92,
+            text=(f'{weapon["name"]}  |  {weapon["type"]}  |  '
+                  f'{weapon["price"]:,} COINS OR '
+                  f'{self.gem_price(weapon["price"])} GEMS'),
+            fill="#e5c874", font=("Segoe UI", 12, "bold"), tags="frame"
+        )
+        c.create_rectangle(100, 130, 860, 445, fill="#18201f",
+                           outline="#69766b", width=2, tags="frame")
+        c.create_text(480, 152, text="TEST RANGE",
+                      fill="#c2c7b9", font=("Segoe UI", 10, "bold"), tags="frame")
+        c.create_oval(704, 270, 770, 336, fill="#473a43",
+                      outline="#d4bd91", width=3, tags="frame")
+        c.create_rectangle(724, 287, 750, 317, fill="#875b72",
+                           outline="#302e32", tags="frame")
+        c.create_text(737, 350, text="TARGET", fill="#c2c7b9",
+                      font=("Segoe UI", 8, "bold"), tags="frame")
+        c.create_oval(245, 270, 285, 310, fill="#72a2ad",
+                      outline="#d5d9c0", width=2, tags="frame")
+        c.create_line(282, 291, 342, 291, fill="#d2a64e", width=6, tags="frame")
+
+        if 0 <= elapsed <= 1.8:
+            progress = min(1, elapsed / 1.25)
+            if weapon["type"] == "LASER":
+                c.create_line(344, 291, 737, 303, fill="#7cf9ff",
+                              width=15, tags="frame")
+                c.create_line(344, 291, 737, 303, fill="#ffffff",
+                              width=4, tags="frame")
+                c.create_oval(717, 283, 757, 323, outline="#8ee5f0",
+                              width=4, tags="frame")
+            elif weapon["type"] == "ROCKET":
+                rocket_x = 344 + (737 - 344) * progress
+                c.create_line(344, 291, rocket_x - 8, 291, fill="#ff824a",
+                              width=4, tags="frame")
+                c.create_oval(rocket_x - 10, 281, rocket_x + 10, 301,
+                              fill="#d5d6c6", outline="#ffb64d",
+                              width=3, tags="frame")
+                if elapsed >= 1.25:
+                    c.create_oval(690, 256, 784, 350, outline="#ffb64d",
+                                  width=7, tags="frame")
+                    c.create_text(737, 238, text="AREA BLAST",
+                                  fill="#ffb64d", font=("Segoe UI", 9, "bold"),
+                                  tags="frame")
+            else:
+                bomb_y = 170 + 130 * progress
+                c.create_line(737, 169, 737, bomb_y, fill="#d2a64e",
+                              dash=(3, 5), width=3, tags="frame")
+                c.create_oval(725, bomb_y - 12, 749, bomb_y + 12,
+                              fill="#282d29", outline="#ffb64d",
+                              width=3, tags="frame")
+                if elapsed >= 1.25:
+                    c.create_oval(480, 165, 860, 445, fill="#bd6555",
+                                  stipple="gray50", outline="#ffb64d",
+                                  width=5, tags="frame")
+                    c.create_text(670, 210, text="LARGE ATOMIC BLAST",
+                                  fill="#fff1d2", font=("Segoe UI", 11, "bold"),
+                                  tags="frame")
+        if elapsed < 0:
+            instruction = "Press TEST FIRE to see this weapon's attack."
+        else:
+            instruction = (
+                "LASER: piercing beam" if weapon["type"] == "LASER" else
+                ("ROCKET: projectile and area blast" if weapon["type"] == "ROCKET"
+                 else "ATOMIC: half-map blast")
+            )
+        c.create_text(
+            WIDTH / 2, 475,
+            text=f"{instruction}  |  TEST ONLY: uses no ammo, coins, or combat damage.",
+            fill="#c2c7b9", font=("Segoe UI", 10, "bold"), tags="frame"
+        )
+        c.create_rectangle(45, 535, 245, 590, fill="#35443d",
+                           outline="#d4bd91", tags="frame")
+        c.create_text(145, 562, text="BACK TO MARKET",
+                      fill="#fff1d2", font=("Segoe UI", 9, "bold"), tags="frame")
+        c.create_rectangle(270, 535, 505, 590, fill="#53634d",
+                           outline="#d4bd91", tags="frame")
+        c.create_text(387, 562, text="TEST FIRE",
+                      fill="#fff1d2", font=("Segoe UI", 11, "bold"), tags="frame")
+        owned = self.preview_weapon_id in self.owned_special_weapons
+        c.create_rectangle(530, 535, 915, 590,
+                           fill="#35443d" if not owned else "#202624",
+                           outline="#d4bd91", tags="frame")
+        c.create_text(
+            722, 562,
+            text=("OWNED - EQUIP IN SPECIAL WEAPONS" if owned
+                  else f"BUY FOR {weapon['price']:,} COINS"),
+            fill="#e5c874" if not owned else "#929c93",
+            font=("Segoe UI", 9, "bold"), tags="frame"
+        )
+        if now < self.message_until:
+            c.create_text(WIDTH / 2, 510, text=self.message,
+                          fill="#e5c874", font=("Segoe UI", 10, "bold"),
+                          tags="frame")
+
+    def draw_purchase_confirmation(self):
+        details = self.pending_purchase_details()
+        if details is None:
+            self.cancel_market_purchase()
+            return
+        name, price = details
+        gem_cost = self.gem_price(price)
+        can_afford_coins = self.coins >= price
+        can_afford_gems = self.gems >= gem_cost
+        c = self.canvas
+        c.create_rectangle(0, 0, WIDTH, HEIGHT, fill="#101718", tags="frame")
+        c.create_rectangle(170, 130, 790, 515, fill="#202a27",
+                           outline="#d4bd91", width=2, tags="frame")
+        c.create_text(WIDTH / 2, 175, text="CONFIRM PURCHASE",
+                      fill="#f0d7c5", font=("Segoe UI", 25, "bold"), tags="frame")
+        c.create_text(WIDTH / 2, 225, text=name,
+                      fill="#e5c874", font=("Segoe UI", 17, "bold"), tags="frame")
+        c.create_text(WIDTH / 2, 275,
+                      text=f"PRICE: {price:,} COINS  OR  {gem_cost} GEMS",
+                      fill="#d0d4c2", font=("Segoe UI", 13, "bold"), tags="frame")
+        c.create_text(WIDTH / 2, 312,
+                      text=f"CURRENT: {self.coins:,} COINS  |  {self.gems} GEMS",
+                      fill="#8ee5f0", font=("Segoe UI", 13, "bold"), tags="frame")
+        c.create_text(
+            WIDTH / 2, 344,
+            text=f"AFTER COINS: {self.coins - price:,}  |  AFTER GEMS: {self.gems - gem_cost}",
+            fill="#a5d46d" if can_afford_coins or can_afford_gems else "#e28b73",
+            font=("Segoe UI", 12, "bold"), tags="frame"
+        )
+        if not can_afford_coins and not can_afford_gems:
+            c.create_text(WIDTH / 2, 375, text="NOT ENOUGH COINS OR GEMS",
+                          fill="#e28b73", font=("Segoe UI", 10, "bold"),
+                          tags="frame")
+        c.create_rectangle(
+            120, 410, 365, 480,
+            fill="#53634d" if can_afford_coins else "#303735",
+            outline="#d4bd91", tags="frame"
+        )
+        c.create_text(242, 445,
+                      text="BUY WITH COINS" if can_afford_coins else "NOT ENOUGH COINS",
+                      fill="#fff1d2" if can_afford_coins else "#929c93",
+                      font=("Segoe UI", 9, "bold"), tags="frame")
+        c.create_rectangle(
+            380, 410, 600, 480,
+            fill="#53634d" if can_afford_gems else "#303735",
+            outline="#d4bd91", tags="frame"
+        )
+        c.create_text(490, 445,
+                      text=f"BUY WITH {gem_cost} GEMS" if can_afford_gems else "NOT ENOUGH GEMS",
+                      fill="#fff1d2" if can_afford_gems else "#929c93",
+                      font=("Segoe UI", 9, "bold"), tags="frame")
+        c.create_rectangle(615, 410, 840, 480, fill="#35443d",
+                           outline="#d4bd91", tags="frame")
+        c.create_text(727, 445, text="CANCEL",
+                      fill="#fff1d2", font=("Segoe UI", 11, "bold"), tags="frame")
+        c.create_text(WIDTH / 2, 490, text="Press ESC to cancel",
+                      fill="#aeb6aa", font=("Segoe UI", 9), tags="frame")
 
     def draw_skill_forge(self):
         c = self.canvas
@@ -3274,6 +4047,54 @@ class BattlefieldRPG:
             text=f"COPIES HELD: {len(self.skill_copies)}  |  PAGE {self.forge_page + 1}/{pages}  |  NO COIN COST",
             fill="#c2c7b9", font=("Segoe UI", 9, "bold"), tags="frame"
         )
+        self.draw_forge_animation()
+
+    def draw_forge_animation(self):
+        if not self.forge_animation_started_at:
+            return
+        elapsed = time.monotonic() - self.forge_animation_started_at
+        if elapsed >= 2.8:
+            self.forge_animation_started_at = 0
+            self.forge_animation_name = ""
+            return
+        progress = max(0, min(1, elapsed / 2.4))
+        radius = 42 + progress * 185
+        c = self.canvas
+        center_x, center_y = WIDTH / 2, HEIGHT / 2
+        c.create_rectangle(0, 0, WIDTH, HEIGHT, fill="#07090d",
+                           stipple="gray50", outline="", tags="frame")
+        c.create_oval(center_x - radius, center_y - radius,
+                      center_x + radius, center_y + radius,
+                      fill="#10232a", stipple="gray50",
+                      outline="#80eaff", width=4, tags="frame")
+        for index, (start, extent) in enumerate(((15, 88), (125, 102), (263, 79))):
+            inset = index * 13
+            c.create_arc(
+                center_x - radius + inset, center_y - radius + inset,
+                center_x + radius - inset, center_y + radius - inset,
+                start=start + elapsed * 35, extent=extent,
+                style=tk.ARC, outline=("#d7fbff", "#83eaff", "#e5c874")[index],
+                width=4 - index, tags="frame"
+            )
+        for angle in (18, 83, 151, 218, 297, 340):
+            radians = math.radians(angle + elapsed * 7)
+            inner = radius * 0.62
+            outer = radius + 16
+            c.create_line(
+                center_x + math.cos(radians) * inner,
+                center_y + math.sin(radians) * inner,
+                center_x + math.cos(radians) * outer,
+                center_y + math.sin(radians) * outer,
+                fill="#d9faff", width=2, tags="frame"
+            )
+        c.create_oval(center_x - 32, center_y - 32,
+                      center_x + 32, center_y + 32,
+                      fill="#d9faff", outline="#fff7d1", width=3,
+                      tags="frame")
+        c.create_text(center_x, center_y + radius + 38,
+                      text=f"{self.forge_animation_name.upper()} FORGED",
+                      fill="#fff1d2", font=("Segoe UI", 20, "bold"),
+                      tags="frame")
 
     def draw_boss_corpse(self, corpse):
         x, y = corpse["x"], corpse["y"]
@@ -3442,7 +4263,8 @@ class BattlefieldRPG:
         self.canvas.create_text(WIDTH - 24, 24, text=f"DEFEATED  {self.kills}",
                                 anchor="e", fill="#c6c5b4", font=("Segoe UI", 10, "bold"),
                                 tags="frame")
-        self.canvas.create_text(WIDTH - 24, 51, text=f"COINS  {self.coins}",
+        self.canvas.create_text(WIDTH - 24, 51,
+                                text=f"COINS {self.coins}  |  GEMS {self.gems}",
                                 anchor="e", fill="#ebc86a",
                                 font=("Segoe UI", 10, "bold"), tags="frame")
         if self.state in ("playing", "post_boss"):
@@ -3454,10 +4276,12 @@ class BattlefieldRPG:
                                     fill="#fff1d2", font=("Segoe UI", 8, "bold"),
                                     tags="frame")
         region_status = f"REGION  {REGIONS[self.region][0]}"
-        if self.evolved:
+        if self.superhuman_active:
+            region_status = f"SUPERHUMAN  -  LEVEL 100  |  {region_status}"
+        elif self.evolved:
             region_status = f"ASCENDED  -  LEVEL 100  |  {region_status}"
-        elif self.has_all_boss_skills():
-            region_status += "  |  EVOLUTION READY  -  PRESS T"
+        elif len(self.skill_copies) >= 7:
+            region_status += "  |  SUPERHUMAN READY  -  PRESS T"
         self.canvas.create_text(WIDTH / 2, 68,
                                 text=region_status,
                                 fill="#d0d4c2", font=("Segoe UI", 8, "bold"), tags="frame")
@@ -3605,7 +4429,7 @@ class BattlefieldRPG:
             if now < p["knockdown_until"]:
                 self.draw_knockdown(p["x"], p["y"])
             else:
-                if self.evolved:
+                if self.evolved or self.superhuman_active:
                     self.canvas.create_oval(
                         p["x"] - player_radius - 5,
                         p["y"] - player_radius - 5,
@@ -3809,7 +4633,7 @@ class BattlefieldRPG:
                                     fill="#f0d99f", font=("Segoe UI", 12, "bold"),
                                     tags="frame")
         self.canvas.create_text(WIDTH / 2, HEIGHT - 22,
-                                text="WASD / ARROWS MOVE   SPACE / CLICK SHOOT   1-5 CAST SKILLS   RIGHT-CLICK TO AIM   E INTERACT",
+                                text="MOVE: WASD   SHOOT: SPACE/CLICK   SKILLS: 1-5   AIM: RIGHT-CLICK   E: INTERACT   `: LOADOUT   Q: SIDE QUESTS",
                                 fill="#b9c1ac", font=("Segoe UI", 9, "bold"), tags="frame")
         self.draw_skill_dialogue()
         if self.active_quest:
@@ -3820,6 +4644,8 @@ class BattlefieldRPG:
                                     text=f"QUEST: {quest_title}  {quest_status}",
                                     fill="#e5c874", font=("Segoe UI", 9, "bold"),
                                     tags="frame")
+        if self.quick_loadout_open:
+            self.draw_quick_loadout()
 
     def draw_knockdown(self, x, y):
         c = self.canvas
@@ -4711,7 +5537,7 @@ class BattlefieldRPG:
                               tags="frame")
                 c.create_text(
                     WIDTH / 2, 320,
-                    text="Unlock a market stand from the floor progression screen to buy some.",
+                    text="Reach player level 15 to unlock the marketplace from floor progression.",
                     fill="#929c93", font=("Segoe UI", 10), tags="frame"
                 )
             for row, weapon_id in enumerate(visible):
@@ -4966,6 +5792,14 @@ class BattlefieldRPG:
             self.draw_floor_progression()
         elif self.state == "marketplace":
             self.draw_marketplace()
+        elif self.state == "side_quests":
+            self.draw_side_quests()
+        elif self.state == "purchase_confirmation":
+            self.draw_purchase_confirmation()
+        elif self.state == "skill_market":
+            self.draw_skill_market()
+        elif self.state == "weapon_preview":
+            self.draw_weapon_preview()
         elif self.state == "skill_forge":
             self.draw_skill_forge()
         elif self.state == "special_loadout":

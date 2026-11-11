@@ -1,7 +1,7 @@
 {
   "version": 1,
-  "floor": 5,
-  "floor_wave": 4,
+  "floor": 10,
+  "floor_wave": 6,
   "floor_records": {
     "1": {
       "cleared": true,
@@ -67,12 +67,77 @@
       "kills": 55,
       "level": 12,
       "coins": 465
+    },
+    "6": {
+      "cleared": true,
+      "quest_index": 2,
+      "quest_title": "SWEEP THE FLOOR",
+      "quest_complete": true,
+      "stars": 3,
+      "quest_progress": 12,
+      "quest_target": 12,
+      "quest_reward": 214,
+      "kills": 111,
+      "level": 13,
+      "coins": 246
+    },
+    "7": {
+      "cleared": true,
+      "quest_index": 2,
+      "quest_title": "SWEEP THE FLOOR",
+      "quest_complete": true,
+      "stars": 3,
+      "quest_progress": 12,
+      "quest_target": 12,
+      "quest_reward": 267,
+      "kills": 121,
+      "level": 13,
+      "coins": 304
+    },
+    "8": {
+      "cleared": true,
+      "quest_index": 2,
+      "quest_title": "SWEEP THE FLOOR",
+      "quest_complete": true,
+      "stars": 3,
+      "quest_progress": 12,
+      "quest_target": 12,
+      "quest_reward": 334,
+      "kills": 131,
+      "level": 14,
+      "coins": 479
+    },
+    "9": {
+      "cleared": true,
+      "quest_index": 2,
+      "quest_title": "SWEEP THE FLOOR",
+      "quest_complete": true,
+      "stars": 3,
+      "quest_progress": 12,
+      "quest_target": 12,
+      "quest_reward": 417,
+      "kills": 141,
+      "level": 14,
+      "coins": 1094
+    },
+    "10": {
+      "cleared": true,
+      "quest_index": 2,
+      "quest_title": "SWEEP THE FLOOR",
+      "quest_complete": true,
+      "stars": 3,
+      "quest_progress": 12,
+      "quest_target": 12,
+      "quest_reward": 522,
+      "kills": 151,
+      "level": 15,
+      "coins": 1793
     }
   },
   "owned_special_weapons": [],
   "equipped_special_weapon": null,
   "special_shots_left": 3,
-  "floor_kills_start": 251,
+  "floor_kills_start": 810,
   "active_quest_index": 2,
   "quest_progress": 12,
   "quest_complete": true,
@@ -80,22 +145,22 @@
   "minion_difficulty": null,
   "replay_active": false,
   "replay_return_snapshot": null,
-  "progression_return_state": "paused",
+  "progression_return_state": "menu",
   "player": {
-    "level": 12,
-    "xp": 495,
-    "next_xp": 2338,
-    "speed": 223,
-    "max_hp": 376,
-    "hp": 376
+    "level": 15,
+    "xp": 1076,
+    "next_xp": 7126,
+    "speed": 232,
+    "max_hp": 424,
+    "hp": 424
   },
-  "coins": 465,
-  "kills": 306,
-  "region": 0,
+  "coins": 160,
+  "kills": 961,
+  "region": 2,
   "territories": [
     true,
     true,
-    false,
+    true,
     false
   ],
   "unlocked_abilities": [
@@ -113,6 +178,36 @@
       "Time Freeze",
       "Time, stand still! Time Freeze!",
       "Time bends to my will. Use the pause to strike."
+    ],
+    [
+      "Fusion 001",
+      "Unleash the combined power of Time Freeze and Time Freeze!",
+      "A custom technique forged from two boss skills."
+    ],
+    [
+      "Fusion 002",
+      "Unleash the combined power of Fusion 001 and Time Freeze!",
+      "A custom technique forged from two boss skills."
+    ],
+    [
+      "Fusion 003",
+      "Unleash the combined power of Fusion 002 and Time Freeze!",
+      "A custom technique forged from two boss skills."
+    ],
+    [
+      "Fusion 004",
+      "Unleash the combined power of Fusion 003 and Time Freeze!",
+      "A custom technique forged from two boss skills."
+    ],
+    [
+      "Pyro-Quake",
+      "Unleash the combined power of Ember Volley and Groundsplit!",
+      "A custom technique forged from two boss skills."
+    ],
+    [
+      "Ice Stars",
+      "Winter sky, fall! Ice Stars!",
+      "Call the stars down wherever your enemies gather."
     ]
   ],
   "equipped_abilities": [
@@ -130,11 +225,62 @@
       "Time Freeze",
       "Time, stand still! Time Freeze!",
       "Time bends to my will. Use the pause to strike."
+    ],
+    [
+      "Fusion 001",
+      "Unleash the combined power of Time Freeze and Time Freeze!",
+      "A custom technique forged from two boss skills."
+    ],
+    [
+      "Fusion 002",
+      "Unleash the combined power of Fusion 001 and Time Freeze!",
+      "A custom technique forged from two boss skills."
     ]
   ],
-  "active_ability": 0,
-  "weapon_upgrade": 4,
-  "skill_upgrade": 7,
+  "skill_copies": [
+    [
+      "Pyro-Quake",
+      "Unleash the combined power of Ember Volley and Groundsplit!",
+      "A custom technique forged from two boss skills."
+    ],
+    [
+      "Ice Stars",
+      "Winter sky, fall! Ice Stars!",
+      "Call the stars down wherever your enemies gather."
+    ]
+  ],
+  "crafted_skill_data": {
+    "Fusion 001": {
+      "damage": 200,
+      "range": 800,
+      "crafted": true
+    },
+    "Fusion 002": {
+      "damage": 300,
+      "range": 1200,
+      "crafted": true
+    },
+    "Fusion 003": {
+      "damage": 400,
+      "range": 1600,
+      "crafted": true
+    },
+    "Fusion 004": {
+      "damage": 500,
+      "range": 2000,
+      "crafted": true
+    },
+    "Pyro-Quake": {
+      "damage": 480,
+      "range": 780,
+      "crafted": true
+    }
+  },
+  "next_crafted_skill_id": 6,
+  "evolved": false,
+  "active_ability": 2,
+  "weapon_upgrade": 10,
+  "skill_upgrade": 11,
   "health_upgrade": 4,
   "boss_weapon_owned": true,
   "advanced_gun_owned": true,
@@ -168,7 +314,12 @@
     2,
     3,
     4,
-    5
+    5,
+    6,
+    7,
+    8,
+    9,
+    10
   ],
   "tower_clues": [],
   "rescue_route_unlocked": false
