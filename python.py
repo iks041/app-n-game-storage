@@ -1,6 +1,8 @@
 import base64
+import json
 import logging
 import math
+import os
 import queue
 import random
 import struct
@@ -18,6 +20,7 @@ if sys.platform == "win32":
 
 WIDTH = 960
 HEIGHT = 640
+MAX_FLOORS = 200
 ARENA = (24, 92, WIDTH - 24, HEIGHT - 48)
 REGIONS = [
     ("ASHEN FRONT", "#45544a", "#b7955f", "#60725c"),
@@ -49,6 +52,35 @@ BOSS_SKILLS = (
      "The Ember Volley is yours. Aim true, little spark."),
     ("Ironbark Guard", 'Roots, guard me! Ironbark Guard!',
      "My Ironbark Guard is yours. Stand firm."),
+)
+MILESTONE_BOSS_SKILLS = (
+    ("Time Freeze", "Time, stand still! Time Freeze!",
+     "Time bends to my will. Use the pause to strike."),
+    ("Ice Stars", "Winter sky, fall! Ice Stars!",
+     "Call the stars down wherever your enemies gather."),
+    ("Epic Fall", "Become the mountain! Epic Fall!",
+     "Grow mighty, then bring the whole battlefield down."),
+)
+ALL_BOSS_SKILLS = BOSS_SKILLS + MILESTONE_BOSS_SKILLS
+MAX_ABILITIES = 5
+TARGETED_SKILLS = frozenset(("Ice Stars", "Epic Fall"))
+SAVE_VERSION = 1
+MINION_DIFFICULTIES = (
+    ("SCOUT", 100_000, 200),
+    ("WARRIOR", 250_000, 500),
+    ("DEMON SLAYER", 500_000, 1_000),
+)
+MARKET_WEAPON_COUNT = 1_000
+SPECIAL_SHOTS_PER_FLOOR = 3
+MARKET_WEAPONS = tuple(
+    {
+        "id": index,
+        "name": f"{('Prism Lance', 'Frostfire Rocket', 'Starfall Bomb')[index % 3]} "
+                f"{index + 1:04d}",
+        "type": ("LASER", "ROCKET", "ATOMIC")[index % 3],
+        "price": 5_000 + (index // 3) * 125,
+    }
+    for index in range(MARKET_WEAPON_COUNT)
 )
 BOSS_DIALOGUES = (
     "I WILL KILL YOU!",
@@ -235,10 +267,16 @@ class BattlefieldRPG:
         )
         self.canvas.pack()
         self.canvas.bind("<Button-1>", self.on_click)
+        self.canvas.bind("<Button-3>", self.on_right_click)
         self.canvas.bind("<Motion>", self.on_mouse_move)
         self.root.bind("<KeyPress>", self.on_key_down)
         self.root.bind("<KeyRelease>", self.on_key_up)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
+        self.save_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "ashen_front_save.json"
+        )
+        self.save_notice = ""
+        self.save_notice_until = 0
 
         self.keys = set()
         self.decor = self.make_decor()
@@ -301,6 +339,7 @@ class BattlefieldRPG:
             "ability_until": 0,
             "knockdown_until": 0,
             "shield_until": 0,
+            "frozen_until": 0,
         }
         self.enemies = []
         self.pickups = []
@@ -309,9 +348,25 @@ class BattlefieldRPG:
         self.boss_corpses = []
         self.boss_chests = []
         self.wave = 1
+        self.floor_number = 1
+        self.floor_wave = 1
+        self.encounter_clear = False
         self.wave_left = 0
         self.wave_pause = 0
+        self.minion_difficulty = None
+        self.floor_records = {}
+        self.progression_page = 0
+        self.progression_selected_floor = 1
+        self.progression_return_state = "menu"
+        self.market_stand_floor = None
+        self.market_page = 0
+        self.market_filter = "ALL"
+        self.market_search = ""
+        self.owned_special_weapons = []
+        self.equipped_special_weapon = None
+        self.special_shots_left = SPECIAL_SHOTS_PER_FLOOR
         self.kills = 0
+        self.floor_kills_start = 0
         self.coins = 0
         self.auto_aim_enabled = False
         self.region = 0
@@ -320,6 +375,10 @@ class BattlefieldRPG:
         self.has_boss_ability = False
         self.unlocked_abilities = []
         self.active_ability = 0
+        self.ability_cooldowns = {}
+        self.pending_target_ability = None
+        self.time_freeze_until = 0
+        self.time_freeze_owner = None
         self.message = ""
         self.message_until = 0
         self.weapon_upgrade = 0
@@ -339,6 +398,7 @@ class BattlefieldRPG:
         self.quest_reward = 0
         self.quest_rewards = []
         self.quest_complete = False
+        self.active_quest_index = 0
         self.tower_clues = []
         self.rescue_route_unlocked = False
         self.rescue_battle = False
@@ -354,48 +414,126 @@ class BattlefieldRPG:
         self.spawn_wave()
 
     def stage_number(self):
-        return (self.wave - 1) // 4 + 1
+        return max(1, min(MAX_FLOORS, self.floor_number))
 
     def stage_label(self):
-        return f"FLOOR {min(100, self.stage_number())}/100"
+        return f"FLOOR {self.stage_number()}/{MAX_FLOORS}"
+
+    def regular_waves_per_floor(self, floor=None):
+        floor = self.stage_number() if floor is None else floor
+        return 3 + 2 * ((floor - 1) // 5)
+
+    def is_minion_boss_wave(self):
+        return (
+            not self.rescue_battle
+            and self.stage_number() % 5 == 0
+            and self.floor_wave == self.regular_waves_per_floor() + 1
+        )
+
+    def floor_wave_count(self, floor=None):
+        floor = self.stage_number() if floor is None else floor
+        return self.regular_waves_per_floor(floor) + (
+            2 if floor % 5 == 0 else 1
+        )
+
+    def begin_floor(self, floor):
+        self.floor_number = max(1, min(MAX_FLOORS, floor))
+        self.floor_wave = 1
+        self.active_quest = None
+        self.quest_progress = 0
+        self.quest_complete = False
+        self.encounter_clear = False
+        self.wave += 1
+        self.wave_left = 0
+        self.wave_pause = 0
+        self.minion_difficulty = None
+        self.special_shots_left = SPECIAL_SHOTS_PER_FLOOR
+        self.floor_kills_start = self.kills
+        self.pending_target_ability = None
+        self.boss_corpses.clear()
+        self.boss_chests.clear()
+        self.pickups.clear()
+        self.projectiles.clear()
+        self.effects.clear()
+        self.spawn_wave()
+        self.save_game()
 
     def spawn_wave(self):
-        if self.wave % 4 == 0:
+        regular_waves = self.regular_waves_per_floor()
+        if self.floor_wave > regular_waves:
             self.wave_left = 1
-            self.message = "BOSS WAVE  -  " + self.boss_name()
-            self.state = "boss_warning"
-            self.boss_warning_until = time.monotonic() + 3
+            if self.is_minion_boss_wave():
+                self.state = "minion_difficulty"
+                self.message = "CHOOSE THE DEMON MINION'S DIFFICULTY"
+            else:
+                self.message = "BOSS WAVE  -  " + self.boss_name()
+                self.state = "boss_warning"
+                self.boss_warning_until = time.monotonic() + 3
         else:
-            self.wave_left = 4 + self.wave * 2
+            self.wave_left = 4 + self.stage_number() * 2 + self.floor_wave * 2
             stage = ROMAN_NUMERALS[(self.stage_number() - 1) % len(ROMAN_NUMERALS)]
-            stage_wave = (self.wave - 1) % 4 + 1
-            self.message = f"STAGE {stage}  -  WAVE {stage_wave}/3  -  HOLD THE LINE"
+            self.message = (
+                f"FLOOR {self.stage_number()}  -  WAVE "
+                f"{self.floor_wave}/{self.regular_waves_per_floor()}  -  HOLD THE LINE"
+            )
         self.message_until = time.monotonic() + 2.2
+
+    def select_minion_difficulty(self, difficulty_index):
+        if not 0 <= difficulty_index < len(MINION_DIFFICULTIES):
+            return
+        self.minion_difficulty = difficulty_index
+        difficulty, health, reward = MINION_DIFFICULTIES[difficulty_index]
+        self.state = "boss_warning"
+        self.boss_warning_until = time.monotonic() + 3
+        self.message = (
+            f"{difficulty} MINION  -  {health:,} HP  -  "
+            f"{reward:,} COINS ON DEFEAT"
+        )
+        self.message_until = self.boss_warning_until
 
     def boss_name(self):
         if self.rescue_battle:
             return "The Veil Thief"
         floor = self.stage_number()
-        if floor % 5 == 0:
+        if self.is_minion_boss_wave():
             return TOWER_MINIONS[(floor // 5 - 1) % len(TOWER_MINIONS)][0]
         names = ("The Faultkeeper", "Rimebreaker", "The Red Maw", "Ironwood Colossus")
-        return names[(self.wave // 4 - 1) % len(names)]
+        return names[(floor - 1) % len(names)]
 
     def boss_dialogue(self):
         if self.rescue_battle:
             return "Your borrowed weapon cannot touch the truth behind me!"
         floor = self.stage_number()
-        if floor % 5 == 0:
+        if self.is_minion_boss_wave():
             return TOWER_MINIONS[(floor // 5 - 1) % len(TOWER_MINIONS)][1]
-        return BOSS_DIALOGUES[(self.wave // 4 - 1) % len(BOSS_DIALOGUES)]
+        return BOSS_DIALOGUES[(floor - 1) % len(BOSS_DIALOGUES)]
 
     def boss_skill(self):
-        return BOSS_SKILLS[(self.wave // 4 - 1) % len(BOSS_SKILLS)]
+        milestone = min(
+            len(MILESTONE_BOSS_SKILLS), self.player["level"] // 10
+        )
+        if milestone:
+            return MILESTONE_BOSS_SKILLS[milestone - 1]
+        return BOSS_SKILLS[(self.stage_number() - 1) % len(BOSS_SKILLS)]
 
     def on_click(self, event):
+        if self.state == "menu":
+            if 325 <= event.x <= 635 and 320 <= event.y <= 375:
+                if self.has_save():
+                    self.load_game()
+                else:
+                    self.start_game()
+            elif self.has_save() and 325 <= event.x <= 635 and 392 <= event.y <= 442:
+                self.start_game()
+            elif self.has_save() and 325 <= event.x <= 635 and 455 <= event.y <= 500:
+                self.load_game()
+                self.open_floor_progression("menu")
+            return
         if self.state == "tower_exterior":
             if 340 <= event.x <= 620 and 330 <= event.y <= 500:
                 self.start_opening_cutscene()
+            elif 760 <= event.x <= 930 and 20 <= event.y <= 58:
+                self.open_floor_progression("tower_exterior")
             return
         if self.state == "tower_gate":
             self.message = "FIND THE PORTAL BEHIND THE THRONE, THEN PRESS E"
@@ -406,6 +544,13 @@ class BattlefieldRPG:
                 x1 = 80 + index * 275
                 if x1 <= event.x <= x1 + 245 and 285 <= event.y <= 470:
                     self.accept_quest(index)
+                    return
+            return
+        if self.state == "minion_difficulty":
+            for index in range(len(MINION_DIFFICULTIES)):
+                x1 = 55 + index * 285
+                if x1 <= event.x <= x1 + 255 and 260 <= event.y <= 430:
+                    self.select_minion_difficulty(index)
                     return
             return
         if self.state == "character":
@@ -437,6 +582,8 @@ class BattlefieldRPG:
                 self.last_tick = time.monotonic()
             elif 370 <= event.x <= 590 and 390 <= event.y <= 440:
                 self.state = "character"
+            elif 370 <= event.x <= 590 and 460 <= event.y <= 510:
+                self.open_floor_progression("paused")
             return
         if self.state == "shop":
             self.handle_shop_click(event.x, event.y)
@@ -446,7 +593,16 @@ class BattlefieldRPG:
                 region_index = min(len(REGIONS) - 1, max(0, (event.x - 70) // 210))
                 self.claim_region(region_index)
             return
+        if self.state == "floor_progression":
+            self.handle_progression_click(event.x, event.y)
+            return
+        if self.state == "marketplace":
+            self.handle_market_click(event.x, event.y)
+            return
         if self.state == "post_boss":
+            if 340 <= event.x <= 620 and 465 <= event.y <= 500:
+                self.collect_floor_coins()
+                return
             shop_left, shop_right = ((80, 260) if self.rescue_route_unlocked
                                      else (100, 300))
             terrain_left, terrain_right = ((270, 450) if self.rescue_route_unlocked
@@ -465,11 +621,11 @@ class BattlefieldRPG:
             if self.rescue_route_unlocked and 545 <= event.y <= 600 and 470 <= event.x <= 670:
                 self.start_rescue_route()
                 return
-            continue_x1 = 700 if self.rescue_route_unlocked else 650
-            continue_x2 = 890 if self.rescue_route_unlocked else 850
+            continue_x1 = 690 if self.rescue_route_unlocked else 650
+            continue_x2 = 880 if self.rescue_route_unlocked else 850
             if (545 <= event.y <= 600 and continue_x1 <= event.x <= continue_x2
                     and time.monotonic() >= self.travel_ready_at):
-                self.continue_stage()
+                self.open_floor_progression("post_boss")
                 return
             elif (545 <= event.y <= 600 and continue_x1 <= event.x <= continue_x2):
                 self.message = f"STAY AND COLLECT COINS FOR {self.travel_ready_at - time.monotonic():.1f} MORE SECONDS"
@@ -478,29 +634,72 @@ class BattlefieldRPG:
             dx, dy = event.x - self.player["x"], event.y - self.player["y"]
             self.shoot(time.monotonic(), dx, dy)
             return
-        if self.state in ("menu", "gameover"):
-            self.start_game() if self.state == "menu" else self.restart_stage()
+        if self.state == "gameover":
+            self.restart_stage()
         elif self.state == "stage_intro":
             self.state = "playing"
         elif self.state == "playing":
             dx, dy = event.x - self.player["x"], event.y - self.player["y"]
             self.shoot(time.monotonic(), dx, dy)
 
+    def on_right_click(self, event):
+        if self.state not in ("playing", "post_boss", "boss_skill"):
+            return
+        if self.collect_medkit_at(event.x, event.y):
+            return
+        if self.state != "playing":
+            return
+        if self.pending_target_ability is not None:
+            ability_index = self.pending_target_ability
+            self.pending_target_ability = None
+            self.use_boss_ability(
+                time.monotonic(), ability_index, event.x, event.y
+            )
+            return
+        if 0 <= self.active_ability < len(self.unlocked_abilities):
+            skill_name = self.unlocked_abilities[self.active_ability][0]
+            if skill_name in TARGETED_SKILLS:
+                self.use_boss_ability(
+                    time.monotonic(), self.active_ability, event.x, event.y
+                )
+
+    def collect_medkit_at(self, x, y):
+        medkit = next(
+            (
+                pickup for pickup in self.pickups
+                if pickup["kind"] == "medkit"
+                and math.hypot(pickup["x"] - x, pickup["y"] - y) <= 20
+            ),
+            None,
+        )
+        if medkit is None:
+            return False
+        self.pickups.remove(medkit)
+        self.player["hp"] = min(
+            self.player["max_hp"], self.player["hp"] + 30
+        )
+        self.message = "FIELD MEDKIT  +30 HP"
+        self.message_until = time.monotonic() + 1.3
+        return True
+
     def on_mouse_move(self, event):
         self.mouse_position = (event.x, event.y)
 
     def on_key_down(self, event):
         key = event.keysym.lower()
+        if (key == "s" and event.state & 0x4 and event.state & 0x1):
+            self.save_game(notify=True)
+            return
         was_down = key in self.keys
         self.keys.add(key)
         if key in ("return", "space") and self.state == "menu":
-            self.start_game()
+            self.load_game() if self.has_save() else self.start_game()
         elif key in ("return", "space") and self.state == "gameover":
             self.restart_stage()
-        elif key == "1" and not was_down and self.state == "playing":
-            self.use_boss_ability(time.monotonic())
-        elif key == "2" and not was_down and self.state == "playing":
-            self.select_next_ability(time.monotonic())
+        elif key in ("1", "2", "3", "4", "5") and not was_down and self.state == "playing":
+            self.use_boss_ability(time.monotonic(), int(key) - 1)
+        elif key in ("1", "2", "3") and not was_down and self.state == "minion_difficulty":
+            self.select_minion_difficulty(int(key) - 1)
         elif key == "m" and not was_down and self.state in ("playing", "post_boss"):
             if self.state == "post_boss" and time.monotonic() < self.travel_ready_at:
                 remaining = self.travel_ready_at - time.monotonic()
@@ -509,6 +708,18 @@ class BattlefieldRPG:
                 return
             self.map_return_state = self.state
             self.state = "region_map"
+        elif key == "f" and not was_down and self.state == "playing":
+            self.cycle_special_weapon()
+        elif key == "p" and not was_down and self.state in (
+                "playing", "paused", "tower_exterior"):
+            self.open_floor_progression(self.state)
+        elif self.state == "marketplace" and key in ("backspace", "escape"):
+            if key == "backspace":
+                self.market_search = self.market_search[:-1]
+            else:
+                self.state = "floor_progression"
+        elif self.state == "marketplace" and len(key) == 1 and key.isprintable():
+            self.market_search += key
         elif key == "b" and not was_down and self.state == "post_boss":
             self.open_shop()
         elif key == "c" and not was_down and self.state == "paused":
@@ -533,6 +744,10 @@ class BattlefieldRPG:
                 self.state = self.shop_return_state
             elif self.state == "region_map":
                 self.state = self.map_return_state
+            elif self.state == "floor_progression":
+                self.state = self.progression_return_state
+            elif self.state == "marketplace":
+                self.state = "floor_progression"
             elif self.state == "character":
                 self.state = "paused"
             elif self.state == "auto_aim_prompt":
@@ -551,10 +766,250 @@ class BattlefieldRPG:
         self.canvas.delete("background")
         self.draw_background()
         self.canvas.focus_set()
+        self.save_game()
 
     def close(self):
+        if self.state != "menu":
+            self.save_game()
         self.audio.close()
         self.root.destroy()
+
+    def has_save(self):
+        return os.path.isfile(self.save_path)
+
+    def save_game(self, notify=False):
+        player_fields = ("level", "xp", "next_xp", "speed", "max_hp", "hp")
+        data = {
+            "version": SAVE_VERSION,
+            "floor": self.stage_number(),
+            "floor_wave": self.floor_wave,
+            "floor_records": self.floor_records,
+            "owned_special_weapons": self.owned_special_weapons,
+            "equipped_special_weapon": self.equipped_special_weapon,
+            "special_shots_left": self.special_shots_left,
+            "floor_kills_start": self.floor_kills_start,
+            "active_quest_index": (
+                self.active_quest_index if self.active_quest is not None else None
+            ),
+            "quest_progress": self.quest_progress,
+            "quest_complete": self.quest_complete,
+            "encounter_clear": self.encounter_clear,
+            "minion_difficulty": self.minion_difficulty,
+            "player": {field: self.player[field] for field in player_fields},
+            "coins": self.coins,
+            "kills": self.kills,
+            "region": self.region,
+            "territories": self.territories,
+            "unlocked_abilities": self.unlocked_abilities,
+            "active_ability": self.active_ability,
+            "weapon_upgrade": self.weapon_upgrade,
+            "skill_upgrade": self.skill_upgrade,
+            "health_upgrade": self.health_upgrade,
+            "boss_weapon_owned": self.boss_weapon_owned,
+            "advanced_gun_owned": self.advanced_gun_owned,
+            "owned_cosmetics": {
+                category: sorted(items)
+                for category, items in self.owned_cosmetics.items()
+            },
+            "equipped_cosmetics": self.equipped_cosmetics,
+            "quests_completed": sorted(self.quests_completed),
+            "tower_clues": self.tower_clues,
+            "rescue_route_unlocked": self.rescue_route_unlocked,
+        }
+        temporary_path = self.save_path + ".tmp"
+        try:
+            with open(temporary_path, "w", encoding="utf-8") as save_file:
+                json.dump(data, save_file, indent=2)
+                save_file.flush()
+                os.fsync(save_file.fileno())
+            os.replace(temporary_path, self.save_path)
+        except (OSError, TypeError, ValueError):
+            logging.exception("Could not save the game")
+            self.save_notice = "SAVE FAILED  -  CHECK THE GAME FOLDER"
+        else:
+            self.save_notice = f"GAME SAVED  -  FLOOR {data['floor']}"
+        self.save_notice_until = time.monotonic() + 3
+        if notify:
+            self.message = self.save_notice
+            self.message_until = self.save_notice_until
+
+    def load_game(self):
+        try:
+            with open(self.save_path, "r", encoding="utf-8") as save_file:
+                data = json.load(save_file)
+            if not isinstance(data, dict) or data.get("version") != SAVE_VERSION:
+                raise ValueError("Unsupported save version")
+            floor = data["floor"]
+            player_data = data["player"]
+            if (not isinstance(floor, int) or not 1 <= floor <= MAX_FLOORS
+                    or not isinstance(player_data, dict)):
+                raise ValueError("Invalid saved floor or player data")
+
+            restored_player = {}
+            for field in ("level", "xp", "next_xp", "speed", "max_hp", "hp"):
+                value = player_data[field]
+                if not isinstance(value, int) or value < 0:
+                    raise ValueError(f"Invalid player field: {field}")
+                restored_player[field] = value
+            if restored_player["max_hp"] < 1 or restored_player["next_xp"] < 1:
+                raise ValueError("Invalid player statistics")
+            restored_player["hp"] = max(
+                1, min(restored_player["hp"], restored_player["max_hp"])
+            )
+            coins = int(data["coins"])
+            kills = int(data["kills"])
+            region = int(data["region"])
+            if coins < 0 or kills < 0 or not 0 <= region < len(REGIONS):
+                raise ValueError("Invalid saved progress")
+            territories = data["territories"]
+            if (not isinstance(territories, list)
+                    or len(territories) != len(REGIONS)
+                    or not all(isinstance(value, bool) for value in territories)):
+                raise ValueError("Invalid territories")
+            territories = territories.copy()
+            territories[region] = True
+            if not isinstance(data["unlocked_abilities"], list):
+                raise ValueError("Invalid saved skills")
+            unlocked_abilities = []
+            for skill in data["unlocked_abilities"]:
+                if isinstance(skill, list) and tuple(skill) in ALL_BOSS_SKILLS:
+                    unlocked_abilities.append(tuple(skill))
+            if len(unlocked_abilities) > MAX_ABILITIES:
+                unlocked_abilities = unlocked_abilities[-MAX_ABILITIES:]
+            active_ability = max(
+                0, min(int(data["active_ability"]), len(unlocked_abilities) - 1)
+            ) if unlocked_abilities else 0
+            upgrades = {
+                field: max(0, int(data[field]))
+                for field in ("weapon_upgrade", "skill_upgrade", "health_upgrade")
+            }
+            owned_cosmetics = {}
+            equipped_cosmetics = {}
+            for category, items in COSMETIC_ITEMS.items():
+                saved_owned = data["owned_cosmetics"][category]
+                if not isinstance(saved_owned, list):
+                    raise ValueError("Invalid cosmetic ownership")
+                owned_cosmetics[category] = {
+                    name for name, _, _ in items if name in saved_owned
+                } | {items[0][0]}
+                equipped = data["equipped_cosmetics"][category]
+                equipped_cosmetics[category] = (
+                    equipped if equipped in owned_cosmetics[category]
+                    else items[0][0]
+                )
+            quests_completed = {
+                value for value in data["quests_completed"]
+                if isinstance(value, int) and 1 <= value <= MAX_FLOORS
+            }
+            tower_clues = [
+                clue for clue in data["tower_clues"]
+                if clue in {entry[1] for entry in TOWER_MINIONS}
+            ]
+            floor_records = data.get("floor_records", {})
+            if not isinstance(floor_records, dict):
+                raise ValueError("Invalid floor progression")
+            floor_records = {
+                str(record_floor): record
+                for record_floor, record in floor_records.items()
+                if str(record_floor).isdigit()
+                and 1 <= int(record_floor) <= floor
+                and isinstance(record, dict)
+            }
+            owned_weapons = data.get("owned_special_weapons", [])
+            weapon_ids = {weapon["id"] for weapon in MARKET_WEAPONS}
+            if not isinstance(owned_weapons, list):
+                raise ValueError("Invalid special weapon ownership")
+            owned_weapons = [
+                weapon_id for weapon_id in owned_weapons
+                if isinstance(weapon_id, int) and weapon_id in weapon_ids
+            ]
+            equipped_weapon = data.get("equipped_special_weapon")
+            if equipped_weapon not in owned_weapons:
+                equipped_weapon = owned_weapons[0] if owned_weapons else None
+
+            self.new_game()
+            self.player.update(restored_player)
+            self.coins = coins
+            self.kills = kills
+            self.floor_kills_start = max(
+                0, min(int(data.get("floor_kills_start", kills)), kills)
+            )
+            self.region = region
+            self.territories = territories
+            self.unlocked_abilities = unlocked_abilities
+            self.has_boss_ability = bool(unlocked_abilities)
+            self.active_ability = active_ability
+            for field, value in upgrades.items():
+                setattr(self, field, value)
+            self.boss_weapon_owned = bool(data["boss_weapon_owned"])
+            self.advanced_gun_owned = bool(data["advanced_gun_owned"])
+            self.owned_cosmetics = owned_cosmetics
+            self.equipped_cosmetics = equipped_cosmetics
+            self.quests_completed = quests_completed
+            self.tower_clues = tower_clues
+            self.rescue_route_unlocked = bool(data["rescue_route_unlocked"])
+            self.floor_number = floor
+            self.floor_wave = max(
+                1, min(int(data.get("floor_wave", 1)), self.floor_wave_count(floor))
+            )
+            self.encounter_clear = bool(data.get("encounter_clear", False))
+            minion_difficulty = data.get("minion_difficulty")
+            self.minion_difficulty = (
+                minion_difficulty
+                if isinstance(minion_difficulty, int)
+                and 0 <= minion_difficulty < len(MINION_DIFFICULTIES)
+                else None
+            )
+            self.floor_records = floor_records
+            self.owned_special_weapons = owned_weapons
+            self.equipped_special_weapon = equipped_weapon
+            self.special_shots_left = max(
+                0, min(int(data.get("special_shots_left", SPECIAL_SHOTS_PER_FLOOR)),
+                       SPECIAL_SHOTS_PER_FLOOR)
+            )
+            self.wave = max(1, (floor - 1) * 10 + self.floor_wave)
+            self.player["x"] = WIDTH / 2
+            self.player["y"] = (ARENA[1] + ARENA[3]) / 2
+            self.wave_left = 0
+            self.wave_pause = 0
+            self.rescue_battle = False
+            self.prepare_quest_options()
+            quest_index = data.get("active_quest_index")
+            if isinstance(quest_index, int) and 0 <= quest_index < len(QUEST_OPTIONS):
+                self.active_quest_index = quest_index
+                self.active_quest = QUEST_OPTIONS[quest_index]
+                self.quest_reward = self.quest_rewards[quest_index]
+                self.quest_progress = max(
+                    0, min(int(data.get("quest_progress", 0)), self.active_quest[2])
+                )
+                self.quest_complete = bool(data.get("quest_complete", False))
+                self.quests_completed = set(quests_completed)
+                if self.encounter_clear:
+                    self.state = "post_boss"
+                    self.travel_ready_at = time.monotonic()
+                else:
+                    self.state = "stage_intro"
+                    self.stage_intro_until = time.monotonic() + 1.5
+                    self.spawn_wave()
+            else:
+                self.active_quest = None
+                self.state = "quest_select"
+            self.keys.clear()
+            self.save_game()
+            self.canvas.delete("background")
+            self.draw_background()
+            self.last_tick = time.monotonic()
+        except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+            logging.exception("Could not load the game")
+            self.save_notice = "LOAD FAILED  -  SAVE FILE IS MISSING OR DAMAGED"
+            self.save_notice_until = time.monotonic() + 3
+            self.message = self.save_notice
+            self.message_until = self.save_notice_until
+            return
+        self.save_notice = f"CHECKPOINT LOADED  -  FLOOR {floor}"
+        self.save_notice_until = time.monotonic() + 3
+        self.message = self.save_notice
+        self.message_until = self.save_notice_until
 
     def speak_dialogue(self, text):
         if text and text != self.last_spoken_dialogue:
@@ -568,7 +1023,7 @@ class BattlefieldRPG:
         self.keys.clear()
 
     def enter_tower_floor(self):
-        self.wave = 1
+        self.floor_wave = 1
         self.wave_pause = 0
         self.enemies.clear()
         self.pickups.clear()
@@ -581,10 +1036,11 @@ class BattlefieldRPG:
         self.keys.clear()
 
     def prepare_quest_options(self):
-        floor = min(100, self.stage_number())
-        floor_reward = min(80, 50 + ((floor - 1) // 25) * 10)
+        floor = self.stage_number()
+        growth = 1.25 ** (floor - 1)
         self.quest_rewards = [
-            floor_reward + bonus for bonus in QUEST_REWARD_BONUSES
+            math.floor((50 + bonus) * growth + 0.5)
+            for bonus in QUEST_REWARD_BONUSES
         ]
         self.quest_reward = self.quest_rewards[0]
 
@@ -592,13 +1048,15 @@ class BattlefieldRPG:
         if not 0 <= quest_index < len(QUEST_OPTIONS):
             return
         self.active_quest = QUEST_OPTIONS[quest_index]
+        self.active_quest_index = quest_index
         self.quest_reward = self.quest_rewards[quest_index]
         self.quest_progress = 0
         self.quest_complete = False
         self.begin_stage()
+        self.save_game()
 
     def restart_stage(self):
-        stage_start_wave = (self.stage_number() - 1) * 4 + 1
+        self.floor_wave = 1
         self.player.update(
             x=WIDTH / 2,
             y=(ARENA[1] + ARENA[3]) / 2,
@@ -606,6 +1064,7 @@ class BattlefieldRPG:
             hurt_until=0,
             knockdown_until=0,
             shield_until=0,
+            frozen_until=0,
             attack_ready=0,
             ability_ready=0,
         )
@@ -613,10 +1072,13 @@ class BattlefieldRPG:
         self.pickups.clear()
         self.projectiles.clear()
         self.effects.clear()
-        self.wave = stage_start_wave
         self.wave_pause = 0
         self.pending_skill = None
         self.skill_acquire_progress = 0
+        self.pending_target_ability = None
+        self.ability_cooldowns.clear()
+        self.time_freeze_until = 0
+        self.time_freeze_owner = None
         self.wave_left = 0
         self.state = "stage_intro"
         self.stage_intro_until = time.monotonic() + 2.2
@@ -629,7 +1091,7 @@ class BattlefieldRPG:
         self.last_tick = time.monotonic()
 
     def spawn_enemy(self):
-        if self.wave % 4 == 0:
+        if self.floor_wave > self.regular_waves_per_floor():
             if self.state == "playing":
                 self.state = "boss_warning"
                 self.boss_warning_until = time.monotonic() + 3
@@ -673,8 +1135,8 @@ class BattlefieldRPG:
 
     def spawn_boss(self):
         x, y = ARENA[2] - 75, ARENA[1] + 85
-        is_rescue_boss = self.rescue_battle and self.stage_number() == 100
-        is_minion_boss = self.stage_number() % 5 == 0 and not is_rescue_boss
+        is_rescue_boss = self.rescue_battle
+        is_minion_boss = self.is_minion_boss_wave() and not is_rescue_boss
         kind = "kidnapper" if is_rescue_boss else (
             "minion_boss" if is_minion_boss else "boss"
         )
@@ -682,11 +1144,15 @@ class BattlefieldRPG:
         if is_minion_boss:
             clue_index = min(self.stage_number() // 5 - 1, len(TOWER_MINIONS) - 1)
             minion_clue = TOWER_MINIONS[clue_index][1]
-        base_hp = 520 + (self.wave // 4 - 1) * 160
-        if is_rescue_boss:
-            base_hp = 4200
-        elif is_minion_boss:
-            base_hp = max(600, base_hp // 2)
+        floor = self.stage_number()
+        difficulty = None
+        if is_minion_boss:
+            difficulty = self.minion_difficulty
+            if difficulty is None:
+                difficulty = 0
+            base_hp = MINION_DIFFICULTIES[difficulty][1]
+        else:
+            base_hp = 1_000 + (floor - 1) * 9_000
         self.enemies.append(
             {
                 "x": x,
@@ -707,6 +1173,8 @@ class BattlefieldRPG:
                 "boss_name": self.boss_name(),
                 "skill": None if is_rescue_boss else self.boss_skill(),
                 "clue": minion_clue,
+                "difficulty": difficulty if is_minion_boss else None,
+                "floor_final_boss": self.floor_wave == self.floor_wave_count(),
                 "teleport_ready": time.monotonic() + 3,
                 "clone_ready": time.monotonic() + 5,
             }
@@ -734,28 +1202,254 @@ class BattlefieldRPG:
             self.state = "boss_skill"
             self.skill_acquire_progress = 0
         elif self.state == "minion_reveal" and now >= self.boss_dialogue_until:
-            self.state = "post_boss"
-            self.travel_ready_at = now
-            self.message = self.clue_dialogue
-            self.message_until = now + 3
+            if self.pending_skill:
+                self.state = "boss_skill"
+                self.skill_acquire_progress = 0
+            else:
+                self.state = "post_boss"
+                self.travel_ready_at = now
+                self.message = self.clue_dialogue
+                self.message_until = now + 3
         elif self.state == "kidnapper_reveal" and now >= self.kidnapper_reveal_until:
             self.state = "victory"
             self.rescue_battle = False
 
     def continue_stage(self):
-        if self.stage_number() >= 100:
-            self.message = "THE TOP FLOOR IS THE END OF THE CLIMB."
-            self.message_until = time.monotonic() + 2
+        if self.floor_wave < self.floor_wave_count():
+            self.boss_corpses.clear()
+            self.boss_chests.clear()
+            self.floor_wave += 1
+            self.wave += 1
+            self.minion_difficulty = None
+            self.pending_target_ability = None
+            self.wave_pause = 0
+            self.projectiles.clear()
+            self.state = "stage_intro"
+            self.encounter_clear = False
+            self.stage_intro_until = time.monotonic() + 1.5
+            self.spawn_wave()
+            if self.state == "minion_difficulty":
+                self.message = "CHOOSE THE DEMON MINION'S DIFFICULTY"
+            self.save_game()
             return
-        self.wave += 1
-        self.wave_pause = 0
-        self.projectiles.clear()
-        self.auto_aim_prompt_default = self.auto_aim_enabled
-        if self.auto_aim_prompt_default:
-            self.state = "auto_aim_prompt"
+        if self.stage_number() >= MAX_FLOORS:
+            self.state = "victory"
+            self.message = "THE 200TH FLOOR IS YOURS. THE TOWER IS CONQUERED."
+            self.save_game()
             return
+        self.begin_floor(self.stage_number() + 1)
+        self.state = "quest_select"
+        self.prepare_quest_options()
         self.auto_aim_enabled = False
-        self.show_next_quest()
+        self.save_game()
+
+    def open_floor_progression(self, return_state=None):
+        if return_state is not None:
+            self.progression_return_state = return_state
+        self.progression_selected_floor = self.stage_number()
+        self.progression_page = (self.progression_selected_floor - 1) // 12
+        self.state = "floor_progression"
+
+    def floor_record(self, floor):
+        return self.floor_records.get(str(floor))
+
+    def market_stand_unlocked(self, floor):
+        record = self.floor_record(floor)
+        return floor % 10 == 0 and record is not None and record.get(
+            "quest_index", -1
+        ) >= 1
+
+    def record_floor_clear(self):
+        floor = self.stage_number()
+        if self.floor_record(floor):
+            return
+        quest_index = self.active_quest_index
+        self.floor_records[str(floor)] = {
+            "cleared": True,
+            "quest_index": quest_index,
+            "quest_title": self.active_quest[0] if self.active_quest else "No quest",
+            "quest_complete": self.quest_complete,
+            "stars": quest_index + 1,
+            "quest_progress": self.quest_progress,
+            "quest_target": self.active_quest[2] if self.active_quest else 0,
+            "quest_reward": self.quest_reward,
+            "kills": self.kills - self.floor_kills_start,
+            "level": self.player["level"],
+            "coins": self.coins,
+        }
+        self.save_game()
+
+    def advance_progression_page(self, delta):
+        self.progression_page = max(
+            0, min((MAX_FLOORS - 1) // 12, self.progression_page + delta)
+        )
+
+    def select_progression_floor(self, floor):
+        if 1 <= floor <= self.stage_number():
+            self.progression_selected_floor = floor
+
+    def open_marketplace(self, floor=None):
+        floor = self.progression_selected_floor if floor is None else floor
+        if not self.market_stand_unlocked(floor):
+            return
+        self.market_stand_floor = floor
+        self.market_page = 0
+        self.market_filter = "ALL"
+        self.market_search = ""
+        self.state = "marketplace"
+
+    def handle_progression_click(self, x, y):
+        if y < 112 and 300 <= x <= 430:
+            self.advance_progression_page(-1)
+            return
+        if y < 112 and 530 <= x <= 660:
+            self.advance_progression_page(1)
+            return
+        start = self.progression_page * 12 + 1
+        for index in range(12):
+            col, row = index % 4, index // 4
+            x1, y1 = 36 + col * 153, 170 + row * 96
+            floor = start + index
+            if x1 <= x <= x1 + 137 and y1 <= y <= y1 + 72:
+                self.select_progression_floor(floor)
+                return
+        if y >= 555:
+            if 40 <= x <= 260:
+                self.state = self.progression_return_state
+            elif 355 <= x <= 595:
+                self.open_marketplace()
+            elif 655 <= x <= 920:
+                if (self.progression_return_state == "post_boss"
+                        and self.progression_selected_floor == self.stage_number()):
+                    self.continue_stage()
+
+    def visible_market_weapons(self):
+        weapons = [
+            weapon for weapon in MARKET_WEAPONS
+            if self.market_filter == "ALL" or weapon["type"] == self.market_filter
+        ]
+        query = self.market_search.strip().casefold()
+        if query:
+            weapons = [
+                weapon for weapon in weapons
+                if query in weapon["name"].casefold()
+                or query in weapon["type"].casefold()
+                or query in str(weapon["id"])
+            ]
+        return weapons
+
+    def handle_market_click(self, x, y):
+        if y >= 570 and x <= 180:
+            self.state = "floor_progression"
+            return
+        if y >= 570 and 210 <= x <= 360:
+            filters = ("ALL", "LASER", "ROCKET", "ATOMIC")
+            self.market_filter = filters[
+                (filters.index(self.market_filter) + 1) % len(filters)
+            ]
+            self.market_page = 0
+            return
+        if y >= 570 and x >= 760:
+            self.market_page = max(0, self.market_page - 1)
+            return
+        if y >= 570 and 570 <= x <= 740:
+            self.market_page += 1
+            return
+        if 125 <= y < 565 and 52 <= x <= 910:
+            row = (y - 125) // 43
+            visible = self.visible_market_weapons()
+            index = self.market_page * 10 + row
+            if 0 <= index < len(visible):
+                weapon = visible[index]
+                if weapon["id"] in self.owned_special_weapons:
+                    self.equipped_special_weapon = weapon["id"]
+                    self.message = f'{weapon["name"].upper()} EQUIPPED'
+                elif self.coins >= weapon["price"]:
+                    self.coins -= weapon["price"]
+                    self.owned_special_weapons.append(weapon["id"])
+                    self.equipped_special_weapon = weapon["id"]
+                    self.message = f'{weapon["name"].upper()} PURCHASED AND EQUIPPED'
+                else:
+                    self.message = f'NOT ENOUGH COINS  -  NEED {weapon["price"]:,}'
+                self.message_until = time.monotonic() + 2
+                self.save_game()
+
+    def cycle_special_weapon(self):
+        if not self.owned_special_weapons:
+            self.message = "BUY A SPECIAL WEAPON AT A MARKET STAND"
+        else:
+            index = self.owned_special_weapons.index(self.equipped_special_weapon)
+            self.equipped_special_weapon = self.owned_special_weapons[
+                (index + 1) % len(self.owned_special_weapons)
+            ]
+            weapon = MARKET_WEAPONS[self.equipped_special_weapon]
+            self.message = f'{weapon["name"].upper()} SELECTED'
+        self.message_until = time.monotonic() + 2
+
+    def fire_special_weapon(self, now, fx, fy):
+        if self.special_shots_left <= 0 or self.equipped_special_weapon is None:
+            return
+        weapon = MARKET_WEAPONS[self.equipped_special_weapon]
+        self.special_shots_left -= 1
+        start_x = self.player["x"] + fx * 20
+        start_y = self.player["y"] + fy * 20
+        if weapon["type"] == "LASER":
+            end_x, end_y = start_x + fx * 900, start_y + fy * 900
+            self.effects.append({
+                "kind": "laser", "line": (start_x, start_y, end_x, end_y),
+                "until": now + 0.25,
+            })
+            for enemy in self.enemies[:]:
+                ex, ey = enemy["x"] - start_x, enemy["y"] - start_y
+                along = ex * fx + ey * fy
+                across = abs(ex * fy - ey * fx)
+                if 0 <= along <= 900 and across <= enemy["radius"] + 12:
+                    enemy["hp"] -= 500
+                    if enemy["hp"] <= 0:
+                        self.defeat_enemy(enemy, now)
+        elif weapon["type"] == "ROCKET":
+            self.projectiles.append({
+                "x": start_x, "y": start_y, "vx": fx * 430, "vy": fy * 430,
+                "damage": max(85, int(85 * 0.15)),
+                "life": 1.4, "kind": "rocket", "owner": self.player,
+            })
+        else:
+            self.effects.append({
+                "kind": "atomic_bomb",
+                "x": self.mouse_position[0],
+                "y": self.mouse_position[1],
+                "impact_at": now + 0.8,
+                "until": now + 1.5,
+                "detonated": False,
+            })
+        self.save_game()
+
+    def blast_at(self, x, y, now, damage, radius):
+        self.effects.append({
+            "kind": "atomic", "x": x, "y": y, "radius": radius,
+            "until": now + 0.7,
+        })
+        for enemy in self.enemies[:]:
+            if math.hypot(enemy["x"] - x, enemy["y"] - y) <= radius:
+                enemy["hp"] -= damage
+                if enemy["hp"] <= 0:
+                    self.defeat_enemy(enemy, now)
+
+    def collect_floor_coins(self):
+        coin_pickups = [
+            pickup for pickup in self.pickups if pickup["kind"] == "coins"
+        ]
+        total = sum(pickup["value"] for pickup in coin_pickups)
+        if total:
+            self.pickups = [
+                pickup for pickup in self.pickups if pickup["kind"] != "coins"
+            ]
+            self.coins += total
+            self.message = f"FLOOR COINS COLLECTED  +{total} COINS"
+            self.save_game()
+        else:
+            self.message = "NO FLOOR COINS LEFT TO COLLECT"
+        self.message_until = time.monotonic() + 2.5
 
     def resolve_auto_aim_prompt(self, enabled):
         self.auto_aim_enabled = enabled
@@ -772,7 +1466,6 @@ class BattlefieldRPG:
         self.rescue_battle = True
         self.active_quest = None
         self.demon_ally_next_attack = time.monotonic() + 0.8
-        self.wave = 397
         self.wave_pause = 0
         self.enemies.clear()
         self.pickups.clear()
@@ -823,6 +1516,7 @@ class BattlefieldRPG:
                 )
             self.message = f"{upgrade.upper()} UPGRADED!"
             self.message_until = time.monotonic() + 1.5
+            self.save_game()
 
     def handle_character_click(self, x, y):
         if 70 <= x <= 260 and 550 <= y <= 600:
@@ -886,7 +1580,10 @@ class BattlefieldRPG:
                         reward = "40 BONUS COINS"
                     else:
                         self.boss_weapon_owned = True
-                        reward = "BOSS WEAPON  -  SKILL COOLDOWN -30%"
+                        self.advanced_gun_owned = True
+                        self.owned_cosmetics["GUN"].add("Warden Breaker")
+                        self.equipped_cosmetics["GUN"] = "Warden Breaker"
+                        reward = "WARDEN BREAKER RIFLE  -  SKILL COOLDOWN -30%"
                     self.message = f"BOSS CHEST OPENED  -  {reward}"
                     self.message_until = time.monotonic() + 3
                 else:
@@ -911,26 +1608,40 @@ class BattlefieldRPG:
             return
 
         skill = self.pending_skill
+        replaced_skill = None
+        if (skill not in self.unlocked_abilities
+                and len(self.unlocked_abilities) >= MAX_ABILITIES):
+            replaced_skill = self.unlocked_abilities.pop(0)
+            self.ability_cooldowns.pop(replaced_skill[0], None)
         if skill not in self.unlocked_abilities:
             self.unlocked_abilities.append(skill)
         self.has_boss_ability = True
         self.active_ability = self.unlocked_abilities.index(skill)
+        self.ability_cooldowns.setdefault(skill[0], 0)
         self.pending_skill = None
         self.skill_acquire_progress = 0
         self.state = "post_boss"
         self.travel_ready_at = now
-        self.message = f"SKILL ACQUIRED  -  {skill[0]}"
+        self.message = (
+            f"{replaced_skill[0]} REPLACED BY {skill[0]}"
+            if replaced_skill else f"SKILL ACQUIRED  -  {skill[0]}"
+        )
         self.message_until = now + 2.5
+        self.save_game()
 
     def update(self, dt, now):
         if self.state == "boss_skill" and self.pending_skill:
             self.update_skill_acquire(dt, now)
         p = self.player
+        if now >= self.time_freeze_until:
+            self.time_freeze_until = 0
+            self.time_freeze_owner = None
         dx = (("d" in self.keys or "right" in self.keys) -
               ("a" in self.keys or "left" in self.keys))
         dy = (("s" in self.keys or "down" in self.keys) -
               ("w" in self.keys or "up" in self.keys))
-        if (dx or dy) and now >= p["knockdown_until"]:
+        player_frozen = now < p["frozen_until"]
+        if (dx or dy) and now >= p["knockdown_until"] and not player_frozen:
             length = math.hypot(dx, dy)
             dx, dy = dx / length, dy / length
             p["face"] = (dx, dy)
@@ -945,7 +1656,7 @@ class BattlefieldRPG:
             aim_length = math.hypot(mouse_dx, mouse_dy)
             p["face"] = (mouse_dx / aim_length, mouse_dy / aim_length)
 
-        if "space" in self.keys and now >= p["attack_ready"]:
+        if "space" in self.keys and now >= p["attack_ready"] and not player_frozen:
             fx, fy = p["face"]
             self.shoot(now, fx, fy)
 
@@ -953,6 +1664,9 @@ class BattlefieldRPG:
             self.spawn_enemy()
 
         for enemy in self.enemies[:]:
+            if (now < self.time_freeze_until
+                    and enemy is not self.time_freeze_owner):
+                continue
             ex, ey = p["x"] - enemy["x"], p["y"] - enemy["y"]
             distance = max(1, math.hypot(ex, ey))
             if distance > enemy["radius"] + 20:
@@ -978,6 +1692,9 @@ class BattlefieldRPG:
                 self.update_kidnapper(enemy, now)
 
         for projectile in self.projectiles[:]:
+            if (now < self.time_freeze_until
+                    and projectile.get("owner", p) is not self.time_freeze_owner):
+                continue
             projectile["x"] += projectile["vx"] * dt
             projectile["y"] += projectile["vy"] * dt
             projectile["life"] -= dt
@@ -985,6 +1702,10 @@ class BattlefieldRPG:
             for enemy in self.enemies[:]:
                 if math.hypot(projectile["x"] - enemy["x"],
                               projectile["y"] - enemy["y"]) <= enemy["radius"] + 5:
+                    if projectile.get("kind") == "rocket":
+                        self.blast_at(projectile["x"], projectile["y"], now, 750, 35)
+                        hit = True
+                        break
                     damage = projectile["damage"]
                     if enemy["kind"] == "kidnapper":
                         damage = int(
@@ -998,13 +1719,27 @@ class BattlefieldRPG:
                     if enemy["hp"] <= 0:
                         self.defeat_enemy(enemy, now)
                     break
+            if (not hit and projectile.get("kind") == "rocket"
+                    and projectile["life"] <= 0):
+                self.blast_at(projectile["x"], projectile["y"], now, 750, 35)
+                hit = True
             if hit or projectile["life"] <= 0:
                 self.projectiles.remove(projectile)
 
         self.effects = [effect for effect in self.effects if effect["until"] > now]
         for effect in self.effects:
+            if (effect["kind"] == "atomic_bomb"
+                    and not effect["detonated"] and now >= effect["impact_at"]):
+                effect["detonated"] = True
+                effect["kind"] = "atomic"
+                effect["until"] = now + 0.7
+                self.blast_at(effect["x"], effect["y"], now, 650, 275)
             if effect["kind"] == "shield":
                 effect["x"], effect["y"] = p["x"], p["y"]
+            if (effect["kind"] in ("ice_star_fall", "epic_fall")
+                    and not effect.get("hit")
+                    and now >= effect["impact_at"]):
+                self.resolve_impact(effect, now)
         for pickup in self.pickups[:]:
             if math.hypot(p["x"] - pickup["x"], p["y"] - pickup["y"]) < 24:
                 self.pickups.remove(pickup)
@@ -1022,9 +1757,11 @@ class BattlefieldRPG:
                 self.message = "AREA SECURED"
                 self.message_until = self.wave_pause
             elif now >= self.wave_pause:
-                self.wave += 1
                 self.wave_pause = 0
-                self.spawn_wave()
+                if self.floor_wave < self.floor_wave_count():
+                    self.floor_wave += 1
+                    self.wave += 1
+                    self.spawn_wave()
 
         if self.rescue_battle and now >= self.demon_ally_next_attack:
             target = next(
@@ -1088,10 +1825,40 @@ class BattlefieldRPG:
     def update_boss(self, boss, now):
         if now >= boss["special_ready"] and boss["special_until"] <= 0:
             p = self.player
+            skill_name = boss["skill"][0]
+            boss["special_ready"] = now + 5.5
+            if skill_name == "Time Freeze":
+                self.time_freeze_owner = boss
+                self.time_freeze_until = now + 3
+                p["frozen_until"] = self.time_freeze_until
+                self.effects.append({
+                    "kind": "time_freeze", "x": p["x"], "y": p["y"],
+                    "until": self.time_freeze_until,
+                })
+                self.message = f'{boss["boss_name"]}: "TIME FREEZE!"'
+                self.message_until = now + 2
+                self.audio.speak(f'{boss["boss_name"]}: Time Freeze!')
+                return
+            if skill_name == "Ice Stars":
+                self.spawn_ice_stars(
+                    p["x"], p["y"], now, boss, damage=24, count=3,
+                    spread=34,
+                )
+                self.message = f'{boss["boss_name"]}: "ICE STARS!"'
+                self.message_until = now + 1.5
+                self.audio.speak(f'{boss["boss_name"]}: Ice Stars!')
+                return
+            if skill_name == "Epic Fall":
+                self.spawn_epic_fall(
+                    p["x"], p["y"], now, boss, damage=42
+                )
+                self.message = f'{boss["boss_name"]}: "EPIC FALL!"'
+                self.message_until = now + 1.5
+                self.audio.speak(f'{boss["boss_name"]}: Epic Fall!')
+                return
             dx, dy = p["x"] - boss["x"], p["y"] - boss["y"]
             distance = max(1, math.hypot(dx, dy))
             direction = (dx / distance, dy / distance)
-            skill_name = boss["skill"][0]
             boss["special_line"] = (
                 boss["x"], boss["y"],
                 boss["x"] + direction[0] * (560 if skill_name in ("Groundsplit", "Ember Volley") else 320),
@@ -1166,7 +1933,8 @@ class BattlefieldRPG:
 
     def shoot(self, now, dx, dy):
         p = self.player
-        if now < p["attack_ready"] or now < p["knockdown_until"]:
+        if (now < p["attack_ready"] or now < p["knockdown_until"]
+                or now < p["frozen_until"]):
             return
         if self.auto_aim_enabled and self.enemies:
             target = min(
@@ -1187,6 +1955,7 @@ class BattlefieldRPG:
             "damage": 26 + (p["level"] - 1) * 4 + self.weapon_upgrade * 8,
             "life": 0.75,
         })
+        self.fire_special_weapon(now, fx, fy)
         self.audio.play("shot")
         self.effects.append({"kind": "muzzle", "x": start_x, "y": start_y,
                              "until": now + 0.1, "direction": (fx, fy)})
@@ -1198,22 +1967,40 @@ class BattlefieldRPG:
         self.audio.play("kill")
         self.kills += 1
         self.player["xp"] += enemy["xp"]
+        quest_just_completed = False
+        minion_coin_reward = None
         if self.active_quest and not self.quest_complete:
             self.quest_progress += 1
             if self.quest_progress >= self.active_quest[2]:
                 self.quest_complete = True
+                quest_just_completed = True
                 self.quests_completed.add(self.stage_number())
                 self.coins += self.quest_reward
                 self.message = f"QUEST COMPLETE  +{self.quest_reward} COINS"
                 self.message_until = now + 2.5
 
         if enemy["kind"] in ("boss", "minion_boss", "kidnapper"):
-            self.pickups.append({"x": enemy["x"], "y": enemy["y"], "kind": "coins",
-                                 "value": 40})
+            self.encounter_clear = True
+            is_final_boss = enemy.get(
+                "floor_final_boss",
+                enemy["kind"] != "minion_boss",
+            )
+            if enemy["kind"] == "minion_boss":
+                difficulty = enemy.get("difficulty", self.minion_difficulty or 0)
+                reward = MINION_DIFFICULTIES[difficulty][2]
+                self.coins += reward
+                minion_coin_reward = reward
+            else:
+                self.pickups.append({
+                    "x": enemy["x"], "y": enemy["y"],
+                    "kind": "coins", "value": 40,
+                })
             self.wave_left = 0
             self.wave_pause = 0
             self.keys.clear()
             self.territories[self.region] = True
+            if is_final_boss and enemy["kind"] != "kidnapper":
+                self.record_floor_clear()
             if enemy["kind"] == "kidnapper":
                 self.enemies = [
                     remaining for remaining in self.enemies
@@ -1236,6 +2023,8 @@ class BattlefieldRPG:
                     "y": enemy["y"] + 24,
                     "clicks": 0,
                     "opened": False,
+                    "reward": ("40 BONUS COINS" if self.boss_weapon_owned
+                               else "WARDEN BREAKER"),
                 })
                 if enemy["kind"] == "minion_boss":
                     clue = enemy["clue"]
@@ -1247,6 +2036,9 @@ class BattlefieldRPG:
                         self.owned_cosmetics["GUN"].add("Warden Breaker")
                         self.equipped_cosmetics["GUN"] = "Warden Breaker"
                     self.clue_dialogue = f"{enemy['boss_name']}: \"{enemy['clue']}\""
+                    if enemy["skill"] in MILESTONE_BOSS_SKILLS:
+                        self.pending_skill = enemy["skill"]
+                        self.skill_acquire_progress = 0
                     self.state = "minion_reveal"
                     self.boss_dialogue_until = now + 5
                     self.message = "A TOWER MINION HAS LEFT A CLUE"
@@ -1271,18 +2063,42 @@ class BattlefieldRPG:
         self.effects.append({"kind": "burst", "x": enemy["x"], "y": enemy["y"],
                              "until": now + 0.3})
         self.check_level_up()
+        if minion_coin_reward is not None:
+            self.message = f"DEMON MINION DEFEATED  +{minion_coin_reward:,} COINS"
+            self.message_until = now + 3
+        if quest_just_completed or enemy["kind"] in (
+                "boss", "minion_boss", "kidnapper"):
+            self.save_game()
 
-    def use_boss_ability(self, now):
+    def use_boss_ability(self, now, ability_index=None,
+                         target_x=None, target_y=None):
         p = self.player
         if not self.has_boss_ability:
             self.message = 'SCOUT: "I need to defeat a warlord to learn their technique."'
             self.message_until = now + 1.8
             return
-        if now < p["ability_ready"] or now < p["knockdown_until"]:
+        if ability_index is None:
+            ability_index = self.active_ability
+        if not 0 <= ability_index < len(self.unlocked_abilities):
             return
-        p["ability_ready"] = now + self.boss_ability_cooldown()
+        self.active_ability = ability_index
+        skill = self.unlocked_abilities[ability_index]
+        skill_name = skill[0]
+        ready_at = self.ability_cooldowns.get(skill_name, 0)
+        if now < ready_at:
+            self.message = f"{skill_name.upper()} COOLDOWN  -  {ready_at - now:.1f}s"
+            self.message_until = now + 1
+            return
+        if now < p["knockdown_until"] or now < p["frozen_until"]:
+            return
+        if skill_name in TARGETED_SKILLS and (target_x is None or target_y is None):
+            self.pending_target_ability = ability_index
+            self.message = f"{skill_name.upper()} READY  -  RIGHT-CLICK A TARGET"
+            self.message_until = now + 2
+            return
+        self.ability_cooldowns[skill_name] = now + self.boss_ability_cooldown()
+        p["ability_ready"] = self.ability_cooldowns[skill_name]
         p["ability_until"] = now + 0.55
-        skill = self.unlocked_abilities[self.active_ability]
         self.message = f'SCOUT: "{skill[1]}"'
         self.message_until = now + 1.6
         self.audio.speak(skill[1])
@@ -1322,29 +2138,113 @@ class BattlefieldRPG:
                     "x": p["x"] + fx * 20, "y": p["y"] + fy * 20,
                     "vx": fx * 460, "vy": fy * 460,
                     "damage": int(70 * power), "life": 1.1, "kind": "ember",
+                    "owner": p,
                 })
         elif skill[0] == "Ironbark Guard":
             p["shield_until"] = now + 6 + self.skill_upgrade
             self.effects.append({"kind": "shield", "x": p["x"], "y": p["y"],
                                  "until": p["shield_until"]})
+        elif skill_name == "Time Freeze":
+            self.time_freeze_owner = p
+            self.time_freeze_until = now + 3
+            self.effects.append({
+                "kind": "time_freeze", "x": p["x"], "y": p["y"],
+                "until": self.time_freeze_until,
+            })
+        elif skill_name == "Ice Stars":
+            self.spawn_ice_stars(
+                target_x, target_y, now, p, damage=int(62 * power),
+                count=5, spread=30 * area,
+            )
+        elif skill_name == "Epic Fall":
+            self.spawn_epic_fall(
+                target_x, target_y, now, p, damage=int(175 * power),
+                radius=105 * area,
+            )
+        self.message = f'SCOUT: "{skill[1]}"'
+        self.message_until = now + 1.6
+
+    def spawn_ice_stars(self, x, y, now, caster, damage, count, spread):
+        offsets = ((0, 0), (-1, 0), (1, 0), (0, -1), (0, 1))
+        for index in range(count):
+            offset_x, offset_y = offsets[index % len(offsets)]
+            target_x = max(ARENA[0] + 15, min(
+                ARENA[2] - 15, x + offset_x * spread
+            ))
+            target_y = max(ARENA[1] + 15, min(
+                ARENA[3] - 15, y + offset_y * spread
+            ))
+            impact_at = now + 0.72 + index * 0.08
+            self.effects.append({
+                "kind": "ice_star_fall",
+                "x": target_x,
+                "y": target_y,
+                "start_y": max(ARENA[1], target_y - 190),
+                "impact_at": impact_at,
+                "until": impact_at + 0.38,
+                "caster": caster,
+                "damage": damage,
+                "radius": 31,
+                "hit": False,
+            })
+
+    def spawn_epic_fall(self, x, y, now, caster, damage, radius=95):
+        x = max(ARENA[0] + radius, min(ARENA[2] - radius, x))
+        y = max(ARENA[1] + radius, min(ARENA[3] - radius, y))
+        impact_at = now + 0.9
+        if caster is self.player:
+            self.player["knockdown_until"] = impact_at
+        self.effects.append({
+            "kind": "epic_fall",
+            "x": x,
+            "y": y,
+            "start_y": max(ARENA[1], y - 210),
+            "impact_at": impact_at,
+            "until": impact_at + 0.5,
+            "caster": caster,
+            "damage": damage,
+            "radius": radius,
+            "hit": False,
+        })
+
+    def resolve_impact(self, effect, now):
+        effect["hit"] = True
+        caster = effect["caster"]
+        if caster is self.player:
+            if effect["kind"] == "epic_fall":
+                self.player["x"] = effect["x"]
+                self.player["y"] = effect["y"]
+                self.player["knockdown_until"] = now + 0.45
+            for enemy in self.enemies[:]:
+                distance = math.hypot(
+                    enemy["x"] - effect["x"], enemy["y"] - effect["y"]
+                )
+                if distance <= effect["radius"] + enemy["radius"]:
+                    enemy["hp"] -= effect["damage"]
+                    enemy["hurt_until"] = now + 0.2
+                    if enemy["hp"] <= 0:
+                        self.defeat_enemy(enemy, now)
+        elif math.hypot(
+                self.player["x"] - effect["x"],
+                self.player["y"] - effect["y"]) <= effect["radius"] + 15:
+            if now >= self.player["shield_until"]:
+                self.player["hp"] = max(
+                    0, self.player["hp"] - effect["damage"]
+                )
+            self.player["hurt_until"] = now + 0.8
+            if self.player["hp"] <= 0:
+                self.state = "gameover"
+                self.keys.clear()
 
     def boss_ability_cooldown(self):
         return 7 * 0.7 if self.boss_weapon_owned else 7
-
-    def select_next_ability(self, now):
-        if len(self.unlocked_abilities) < 2:
-            return
-        self.active_ability = (self.active_ability + 1) % len(self.unlocked_abilities)
-        name = self.unlocked_abilities[self.active_ability][0]
-        self.message = f"EQUIPPED  -  {name}"
-        self.message_until = now + 1.5
 
     def claim_region(self, region_index):
         region_index = max(0, min(len(REGIONS) - 1, region_index))
         post_boss = (
             self.pending_skill is not None
-            or self.state == "post_boss"
-            or self.map_return_state == "post_boss"
+            or self.state in ("post_boss", "floor_progression")
+            or self.map_return_state in ("post_boss", "floor_progression")
         )
         self.region = region_index
         self.territories[region_index] = True
@@ -1355,9 +2255,9 @@ class BattlefieldRPG:
         self.draw_background()
         if post_boss:
             self.pending_skill = None
-            self.wave += 1
-            self.wave_pause = 0
-            self.show_next_quest()
+            self.boss_corpses.clear()
+            self.boss_chests.clear()
+            self.open_floor_progression("post_boss")
             self.message = f"TERRITORY CLAIMED  -  {REGIONS[self.region][0]}"
             self.message_until = time.monotonic() + 2
         else:
@@ -1381,7 +2281,9 @@ class BattlefieldRPG:
 
     def check_level_up(self):
         p = self.player
+        leveled_up = False
         while p["xp"] >= p["next_xp"]:
+            leveled_up = True
             p["xp"] -= p["next_xp"]
             p["level"] += 1
             p["next_xp"] = int(p["next_xp"] * 1.45)
@@ -1390,6 +2292,8 @@ class BattlefieldRPG:
             p["speed"] += 3
             self.message = "LEVEL UP!  LEVEL " + str(p["level"])
             self.message_until = time.monotonic() + 2
+        if leveled_up:
+            self.save_game()
 
     def rect(self, x1, y1, x2, y2, color, outline="", tag="frame"):
         self.canvas.create_rectangle(
@@ -1689,6 +2593,152 @@ class BattlefieldRPG:
                     fill=glove_color, outline="#292c29", width=1, tags="frame"
                 )
 
+    def draw_floor_progression(self):
+        c = self.canvas
+        c.create_rectangle(0, 0, WIDTH, HEIGHT, fill="#101718", tags="frame")
+        c.create_text(WIDTH / 2, 34, text="THE 200-FLOOR SPIRAL",
+                      fill="#f0d7c5", font=("Segoe UI", 25, "bold"), tags="frame")
+        c.create_text(WIDTH / 2, 70,
+                      text=f"CURRENT FLOOR {self.stage_number()} / {MAX_FLOORS}",
+                      fill="#e5c874", font=("Segoe UI", 12, "bold"), tags="frame")
+        c.create_rectangle(292, 88, 432, 122, fill="#35443d",
+                           outline="#d4bd91", tags="frame")
+        c.create_text(362, 105, text="◀  PREVIOUS", fill="#fff1d2",
+                      font=("Segoe UI", 9, "bold"), tags="frame")
+        c.create_rectangle(528, 88, 668, 122, fill="#35443d",
+                           outline="#d4bd91", tags="frame")
+        c.create_text(598, 105, text="NEXT  ▶", fill="#fff1d2",
+                      font=("Segoe UI", 9, "bold"), tags="frame")
+        center_x, center_y = 600, 355
+        for floor in range(1, MAX_FLOORS + 1):
+            progress = floor / MAX_FLOORS
+            angle = floor * 0.21
+            radius = 8 + progress * 152
+            x = center_x + math.cos(angle) * radius * 1.15
+            y = center_y + math.sin(angle) * radius * 0.92
+            record = self.floor_record(floor)
+            color = "#e5c874" if record else (
+                "#8ca094" if floor == self.stage_number() else "#38403c"
+            )
+            dot = 3 if floor % 10 == 0 else 1.5
+            c.create_oval(x - dot, y - dot, x + dot, y + dot,
+                          fill=color, outline="", tags="frame")
+        page_first = self.progression_page * 12 + 1
+        for index in range(12):
+            floor = page_first + index
+            col, row = index % 4, index // 4
+            x1, y1 = 36 + col * 153, 170 + row * 96
+            record = self.floor_record(floor)
+            available = floor <= self.stage_number()
+            selected = floor == self.progression_selected_floor
+            fill = "#74563d" if selected else (
+                "#35443d" if available else "#202624"
+            )
+            c.create_rectangle(x1, y1, x1 + 137, y1 + 72, fill=fill,
+                               outline="#e5c874" if selected else "#849087",
+                               width=2 if selected else 1, tags="frame")
+            label = f"FLOOR {floor}"
+            if record:
+                label += "  " + ("★" * record.get("stars", 1))
+            elif floor == self.stage_number():
+                label += "  CURRENT"
+            c.create_text(x1 + 68, y1 + 25, text=label,
+                          fill="#fff1d2" if available else "#7a817b",
+                          font=("Segoe UI", 9, "bold"), tags="frame")
+            if self.market_stand_unlocked(floor):
+                c.create_text(x1 + 68, y1 + 62, text="MARKET STAND",
+                              fill="#8ee5f0", font=("Segoe UI", 7, "bold"),
+                              tags="frame")
+            if record:
+                c.create_text(x1 + 68, y1 + 49,
+                              text=record.get("quest_title", "CLEARED"),
+                              fill="#c2c7b9", font=("Segoe UI", 7, "bold"),
+                              tags="frame")
+        selected = self.progression_selected_floor
+        record = self.floor_record(selected)
+        c.create_text(820, 180, text=f"FLOOR {selected}",
+                      fill="#e5c874", font=("Segoe UI", 17, "bold"), tags="frame")
+        if record:
+            c.create_text(820, 224, text=f"{record.get('stars', 0)} STARS",
+                          fill="#ffe58c", font=("Segoe UI", 13, "bold"), tags="frame")
+            c.create_text(820, 267,
+                          text=f"QUEST: {record.get('quest_title', 'Unknown')}",
+                          width=230, fill="#f0d7c5",
+                          font=("Segoe UI", 9, "bold"), tags="frame")
+            c.create_text(820, 314,
+                          text=(f"QUEST {'COMPLETE' if record.get('quest_complete') else 'INCOMPLETE'}"
+                      f"  {record.get('quest_progress', 0)}/"
+                      f"{record.get('quest_target', 0)}"),
+                          fill="#c2c7b9", font=("Segoe UI", 9), tags="frame")
+            c.create_text(820, 350,
+                          text=f"KILLS {record.get('kills', 0)}  |  REWARD {record.get('quest_reward', 0):,}",
+                          fill="#c2c7b9", font=("Segoe UI", 9), tags="frame")
+        else:
+            c.create_text(820, 245, text="NOT CLEARED YET",
+                          fill="#929c93", font=("Segoe UI", 10, "bold"), tags="frame")
+        c.create_rectangle(40, 555, 260, 598, fill="#35443d",
+                           outline="#d4bd91", tags="frame")
+        c.create_text(150, 576, text="BACK", fill="#fff1d2",
+                      font=("Segoe UI", 10, "bold"), tags="frame")
+        unlocked = self.market_stand_unlocked(selected)
+        c.create_rectangle(355, 555, 595, 598,
+                           fill="#53634d" if unlocked else "#202624",
+                           outline="#d4bd91", tags="frame")
+        c.create_text(475, 576,
+                      text="MARKETPLACE" if unlocked else "MARKET: CLEAR 10TH FLOOR",
+                      fill="#fff1d2" if unlocked else "#7a817b",
+                      font=("Segoe UI", 8, "bold"), tags="frame")
+        next_allowed = (
+            self.progression_return_state == "post_boss"
+            and selected == self.stage_number()
+        )
+        c.create_rectangle(655, 555, 920, 598,
+                           fill="#53634d" if next_allowed else "#202624",
+                           outline="#d4bd91", tags="frame")
+        action = ("NEXT FLOOR / BOSS" if next_allowed else
+                  "REVIEW CLEARED FLOORS")
+        c.create_text(787, 576, text=action,
+                      fill="#fff1d2" if next_allowed else "#7a817b",
+                      font=("Segoe UI", 9, "bold"), tags="frame")
+        c.create_text(WIDTH / 2, 625,
+                      text="SELECT A CLEARED FLOOR TO REVIEW ITS QUEST AND STAR RATING",
+                      fill="#aeb6aa", font=("Segoe UI", 9, "bold"), tags="frame")
+
+    def draw_marketplace(self):
+        c = self.canvas
+        c.create_rectangle(0, 0, WIDTH, HEIGHT, fill="#101718", tags="frame")
+        c.create_text(WIDTH / 2, 38, text="SPECIAL WEAPON MARKET",
+                      fill="#f0d7c5", font=("Segoe UI", 25, "bold"), tags="frame")
+        c.create_text(WIDTH / 2, 76,
+                      text=f"COINS {self.coins:,}  |  1,000 GENERATED WEAPONS  |  SEARCH: {self.market_search or '—'}",
+                      fill="#e5c874", font=("Segoe UI", 10, "bold"), tags="frame")
+        visible = self.visible_market_weapons()
+        pages = max(1, (len(visible) + 9) // 10)
+        self.market_page = min(self.market_page, pages - 1)
+        for row, weapon in enumerate(visible[self.market_page * 10:self.market_page * 10 + 10]):
+            y = 122 + row * 43
+            owned = weapon["id"] in self.owned_special_weapons
+            equipped = weapon["id"] == self.equipped_special_weapon
+            status = "EQUIPPED" if equipped else ("EQUIP" if owned else f"BUY {weapon['price']:,}")
+            c.create_rectangle(52, y, 908, y + 37, fill="#29332f",
+                               outline="#69766b", tags="frame")
+            c.create_text(72, y + 18, anchor="w",
+                          text=f'{weapon["id"] + 1:04d}  {weapon["name"]}  [{weapon["type"]}]',
+                          fill="#f0d7c5", font=("Segoe UI", 9, "bold"), tags="frame")
+            c.create_text(885, y + 18, anchor="e", text=status,
+                          fill="#e5c874", font=("Segoe UI", 9, "bold"), tags="frame")
+        controls = ((40, "BACK"), (210, f"TYPE: {self.market_filter}"),
+                    (390, "TYPE TO SEARCH"), (570, "NEXT PAGE ▶"),
+                    (760, "◀ PREVIOUS"))
+        for x, label in controls:
+            c.create_rectangle(x, 570, x + 150, 606, fill="#35443d",
+                               outline="#d4bd91", tags="frame")
+            c.create_text(x + 75, 588, text=label, fill="#fff1d2",
+                          font=("Segoe UI", 8, "bold"), tags="frame")
+        c.create_text(WIDTH / 2, 626,
+                      text="LASER: PIERCING BEAM  |  ROCKET: AREA BLAST  |  ATOMIC: HALF-MAP BLAST  |  3 SHOTS PER FLOOR",
+                      fill="#c2c7b9", font=("Segoe UI", 8, "bold"), tags="frame")
+
     def draw_boss_corpse(self, corpse):
         x, y = corpse["x"], corpse["y"]
         c = self.canvas
@@ -1723,6 +2773,9 @@ class BattlefieldRPG:
             c.create_line(x - 18, y - 8, x - 14, y - 20,
                           x + 14, y - 20, x + 18, y - 8,
                           fill="#c8a957", width=3, tags="frame")
+            c.create_text(x, y + 23, text=chest.get("reward", "REWARD CLAIMED"),
+                          width=150, fill="#f0d99f",
+                          font=("Segoe UI", 7, "bold"), tags="frame")
             return
         c.create_rectangle(x - 20, y - 10, x + 20, y + 10,
                            fill="#704c32", outline="#f0c45a",
@@ -1732,8 +2785,11 @@ class BattlefieldRPG:
                            width=1, tags="frame")
         c.create_oval(x - 3, y - 3, x + 3, y + 4,
                       fill="#f3e5a5", outline="", tags="frame")
-        c.create_text(x, y + 24, text=f"CLICK CHEST {chest['clicks']}/5",
-                      fill="#f0d99f", font=("Segoe UI", 7, "bold"),
+        c.create_text(x, y + 22, text=chest.get("reward", "BOSS REWARD"),
+                      width=150, fill="#f0d99f",
+                      font=("Segoe UI", 7, "bold"), tags="frame")
+        c.create_text(x, y + 35, text=f"CLICK {chest['clicks']}/5",
+                      fill="#fff1d2", font=("Segoe UI", 7, "bold"),
                       tags="frame")
 
     def draw_skill_dialogue(self):
@@ -1838,7 +2894,7 @@ class BattlefieldRPG:
         self.canvas.create_text(24, 19, text="ASHEN FRONT", anchor="w",
                                 fill="#e6d9ba", font=("Segoe UI", 13, "bold"), tags="frame")
         self.canvas.create_text(24, 48,
-                                text=f"LV {p['level']}  |  FLOOR {min(100, self.stage_number())}/100  |  WAVE {(self.wave - 1) % 4 + 1}/4",
+                                text=f"LV {p['level']}  |  FLOOR {self.stage_number()}/{MAX_FLOORS}  |  WAVE {self.floor_wave}/{self.floor_wave_count()}",
                                 anchor="w", fill="#c6c5b4", font=("Segoe UI", 10, "bold"),
                                 tags="frame")
         self.draw_bar(180, 20, 200, p["hp"] / p["max_hp"], "#c4584e", 13)
@@ -1864,22 +2920,40 @@ class BattlefieldRPG:
         self.canvas.create_text(WIDTH / 2, 68,
                                 text=f"REGION  {REGIONS[self.region][0]}",
                                 fill="#d0d4c2", font=("Segoe UI", 8, "bold"), tags="frame")
-        if not self.has_boss_ability:
-            ability_text = "1  BOSS SKILL  -  DEFEAT A BOSS"
-        else:
-            ability_name = self.unlocked_abilities[self.active_ability][0]
-            ability_text = f"1  {ability_name}  READY" if now >= p["ability_ready"] else (
-                f"1  {ability_name}  {max(0, p['ability_ready'] - now):.1f}s"
+        if self.unlocked_abilities:
+            skill_labels = []
+            for index, skill in enumerate(self.unlocked_abilities):
+                ready_at = self.ability_cooldowns.get(skill[0], 0)
+                state = "READY" if now >= ready_at else f"{ready_at - now:.1f}s"
+                skill_labels.append(f"{index + 1} {skill[0]} {state}")
+            self.canvas.create_text(
+                WIDTH / 2, HEIGHT - 48, text="   |   ".join(skill_labels[:3]),
+                fill="#e1c77d", font=("Segoe UI", 8, "bold"), tags="frame"
             )
-            if self.boss_weapon_owned:
-                ability_text += "  |  BOSS WEAPON -30%"
-        self.canvas.create_text(WIDTH / 2, HEIGHT - 40, text=ability_text,
-                                fill="#e1c77d", font=("Segoe UI", 9, "bold"), tags="frame")
-        if len(self.unlocked_abilities) > 1:
-            self.canvas.create_text(WIDTH / 2, HEIGHT - 56,
-                                    text="2  CYCLE BOSS SKILLS",
-                                    fill="#b9c1ac", font=("Segoe UI", 8, "bold"),
-                                    tags="frame")
+            if len(skill_labels) > 3:
+                self.canvas.create_text(
+                    WIDTH / 2, HEIGHT - 33, text="   |   ".join(skill_labels[3:]),
+                    fill="#e1c77d", font=("Segoe UI", 8, "bold"), tags="frame"
+                )
+        else:
+            self.canvas.create_text(
+                WIDTH / 2, HEIGHT - 40, text="DEFEAT A BOSS TO LEARN A SKILL",
+                fill="#e1c77d", font=("Segoe UI", 9, "bold"), tags="frame"
+            )
+        if self.boss_weapon_owned:
+            self.canvas.create_text(
+                408, 51, text="WEAPON: WARDEN BREAKER",
+                anchor="w", fill="#f0c45a",
+                font=("Segoe UI", 8, "bold"), tags="frame"
+            )
+        if self.equipped_special_weapon is not None:
+            special_weapon = MARKET_WEAPONS[self.equipped_special_weapon]
+            self.canvas.create_text(
+                600, 51,
+                text=f"SPECIAL: {special_weapon['name']}  {self.special_shots_left}/3  [F]",
+                anchor="w", fill="#8ee5f0",
+                font=("Segoe UI", 8, "bold"), tags="frame"
+            )
 
         for pickup in self.pickups:
             x, y = pickup["x"], pickup["y"]
@@ -1889,6 +2963,15 @@ class BattlefieldRPG:
                                         tags="frame")
                 self.canvas.create_text(x, y, text="+", fill="#f3f5da",
                                         font=("Segoe UI", 12, "bold"), tags="frame")
+                if math.hypot(
+                    self.mouse_position[0] - x,
+                    self.mouse_position[1] - y,
+                ) <= 22:
+                    self.canvas.create_text(
+                        x, y - 20, text="RIGHT-CLICK TO COLLECT",
+                        fill="#f3f5da", font=("Segoe UI", 7, "bold"),
+                        tags="frame"
+                    )
             else:
                 self.canvas.create_oval(x - 9, y - 9, x + 9, y + 9,
                                         fill="#d8ae48", outline="#ffeb9e", width=2,
@@ -1948,25 +3031,88 @@ class BattlefieldRPG:
                                             width=13, dash=(3, 5), tags="frame")
                     self.canvas.create_line(x1, y1, x2, y2, fill="#ffe59a",
                                             width=3, dash=(8, 5), tags="frame")
+                if enemy["kind"] == "minion_boss" and enemy.get("clue"):
+                    bubble_y = max(
+                        ARENA[1] + 52,
+                        enemy["y"] - enemy["radius"] - 44,
+                    )
+                    self.canvas.create_rectangle(
+                        enemy["x"] - 142, bubble_y - 37,
+                        enemy["x"] + 142, bubble_y + 15,
+                        fill="#101214", outline="#d4bd91", width=1,
+                        tags="frame"
+                    )
+                    self.canvas.create_text(
+                        enemy["x"], bubble_y - 11,
+                        text=enemy["clue"], width=266,
+                        fill="#f0d7c5", font=("Segoe UI", 8, "bold"),
+                        tags="frame"
+                    )
             else:
                 self.draw_bar(enemy["x"] - 16, enemy["y"] - enemy["radius"] - 11, 32,
                               enemy["hp"] / enemy["max_hp"], "#d57462", 4)
 
+        player_becomes_titan = any(
+            effect["kind"] == "epic_fall"
+            and effect["caster"] is p
+            and effect["impact_at"] > now
+            for effect in self.effects
+        )
         facing = p["face"]
-        if now < p["knockdown_until"]:
-            self.draw_knockdown(p["x"], p["y"])
-        else:
-            self.draw_entity(
-                p["x"], p["y"], 15, "#72a2ad", "#d5d9c0", facing, "scout",
-                moving=any(key in self.keys for key in
-                           ("w", "a", "s", "d", "up", "down", "left", "right"))
-            )
+        if not player_becomes_titan:
+            if now < p["knockdown_until"]:
+                self.draw_knockdown(p["x"], p["y"])
+            else:
+                self.draw_entity(
+                    p["x"], p["y"], 15, "#72a2ad", "#d5d9c0", facing, "scout",
+                    moving=any(key in self.keys for key in
+                               ("w", "a", "s", "d", "up", "down", "left", "right"))
+                )
+            if now < p["frozen_until"]:
+                self.canvas.create_oval(
+                    p["x"] - 23, p["y"] - 25,
+                    p["x"] + 23, p["y"] + 25,
+                    outline="#a9efff", width=3, tags="frame"
+                )
+                self.canvas.create_text(
+                    p["x"], p["y"] - 32, text="FROZEN",
+                    fill="#dffbff", font=("Segoe UI", 7, "bold"),
+                    tags="frame"
+                )
         for projectile in self.projectiles:
+            fill = "#ff824a" if projectile.get("kind") == "ember" else "#ffe28a"
             self.canvas.create_oval(projectile["x"] - 4, projectile["y"] - 4,
                                     projectile["x"] + 4, projectile["y"] + 4,
-                                    fill="#ffe28a", outline="#fff7d1", tags="frame")
+                                    fill=fill, outline="#fff7d1", tags="frame")
         for effect in self.effects:
-            if effect["kind"] in ("fissure", "player_fissure"):
+            if effect["kind"] == "laser":
+                x1, y1, x2, y2 = effect["line"]
+                self.canvas.create_line(x1, y1, x2, y2, fill="#7cf9ff",
+                                        width=14, tags="frame")
+                self.canvas.create_line(x1, y1, x2, y2, fill="#ffffff",
+                                        width=4, tags="frame")
+            elif effect["kind"] == "atomic":
+                radius = effect["radius"]
+                self.canvas.create_oval(
+                    effect["x"] - radius, effect["y"] - radius,
+                    effect["x"] + radius, effect["y"] + radius,
+                    outline="#ffb64d", width=8, tags="frame"
+                )
+            elif effect["kind"] == "atomic_bomb":
+                progress = 1 - max(
+                    0, min(1, (effect["impact_at"] - now) / 0.8)
+                )
+                bomb_y = ARENA[1] + (effect["y"] - ARENA[1]) * progress
+                self.canvas.create_line(
+                    effect["x"], ARENA[1], effect["x"], bomb_y,
+                    fill="#d2a64e", dash=(3, 5), width=2, tags="frame"
+                )
+                self.canvas.create_oval(
+                    effect["x"] - 12, bomb_y - 12,
+                    effect["x"] + 12, bomb_y + 12,
+                    fill="#282d29", outline="#ffb64d", width=3, tags="frame"
+                )
+            elif effect["kind"] in ("fissure", "player_fissure"):
                 x1, y1, x2, y2 = effect["line"]
                 color = "#e9c65e" if effect["kind"] == "fissure" else "#8ed0c1"
                 if effect.get("skill") == "Frost Nova":
@@ -2023,6 +3169,77 @@ class BattlefieldRPG:
                                         width=20, tags="frame")
                 self.canvas.create_line(x1, y1, x2, y2, fill="#ffdc8a",
                                         width=4, dash=(6, 4), tags="frame")
+            elif effect["kind"] == "time_freeze":
+                pulse = 22 + 10 * math.sin(now * 12)
+                for radius in (pulse, pulse + 18, pulse + 36):
+                    self.canvas.create_oval(
+                        effect["x"] - radius, effect["y"] - radius,
+                        effect["x"] + radius, effect["y"] + radius,
+                        outline="#9be9ff", width=2, tags="frame"
+                    )
+            elif effect["kind"] == "ice_star_fall":
+                progress = max(0, min(
+                    1, (now - (effect["impact_at"] - 0.72)) / 0.72
+                ))
+                star_y = effect["start_y"] + (
+                    effect["y"] - effect["start_y"]
+                ) * progress
+                self.canvas.create_oval(
+                    effect["x"] - 23, effect["y"] - 12,
+                    effect["x"] + 23, effect["y"] + 12,
+                    outline="#74d9f0", width=2, dash=(4, 3), tags="frame"
+                )
+                self.canvas.create_polygon(
+                    effect["x"], star_y - 15,
+                    effect["x"] + 6, star_y - 4,
+                    effect["x"] + 16, star_y,
+                    effect["x"] + 6, star_y + 5,
+                    effect["x"], star_y + 16,
+                    effect["x"] - 6, star_y + 5,
+                    effect["x"] - 16, star_y,
+                    effect["x"] - 6, star_y - 4,
+                    fill="#b8f3ff", outline="#effdff", width=2,
+                    tags="frame"
+                )
+                self.canvas.create_line(
+                    effect["x"], star_y - 25, effect["x"], star_y - 8,
+                    fill="#dffbff", width=3, tags="frame"
+                )
+            elif effect["kind"] == "epic_fall":
+                progress = max(0, min(
+                    1, (now - (effect["impact_at"] - 0.9)) / 0.9
+                ))
+                titan_y = effect["start_y"] + (
+                    effect["y"] - effect["start_y"]
+                ) * progress
+                self.canvas.create_oval(
+                    effect["x"] - effect["radius"],
+                    effect["y"] - 16,
+                    effect["x"] + effect["radius"],
+                    effect["y"] + 16,
+                    outline="#e9c65e", width=3, dash=(7, 5), tags="frame"
+                )
+                titan_color = "#9bb8bf" if effect["caster"] is self.player else "#9a5260"
+                self.canvas.create_line(
+                    effect["x"] - 48, titan_y, effect["x"] + 32, titan_y,
+                    fill=titan_color, width=28, tags="frame"
+                )
+                self.canvas.create_oval(
+                    effect["x"] + 27, titan_y - 20,
+                    effect["x"] + 68, titan_y + 20,
+                    fill=titan_color, outline="#f2d5a5", width=2,
+                    tags="frame"
+                )
+                self.canvas.create_line(
+                    effect["x"] - 24, titan_y + 2,
+                    effect["x"] - 72, titan_y + 25,
+                    fill=titan_color, width=12, tags="frame"
+                )
+                self.canvas.create_line(
+                    effect["x"] + 5, titan_y + 2,
+                    effect["x"] + 48, titan_y + 27,
+                    fill=titan_color, width=12, tags="frame"
+                )
         if self.rescue_battle and self.state in ("playing", "boss_warning"):
             self.draw_demon_king(p["x"] - 58, p["y"] + 5, scale=0.36)
         if now < p["hurt_until"] and int(now * 18) % 2 == 0:
@@ -2039,7 +3256,7 @@ class BattlefieldRPG:
                                     fill="#f0d99f", font=("Segoe UI", 12, "bold"),
                                     tags="frame")
         self.canvas.create_text(WIDTH / 2, HEIGHT - 22,
-                                text="WASD / ARROWS MOVE   SPACE / CLICK SHOOT   1 BOSS SKILL   E INTERACT   ESC PAUSE",
+                                text="WASD / ARROWS MOVE   SPACE / CLICK SHOOT   1-5 CAST SKILLS   RIGHT-CLICK TO AIM   E INTERACT",
                                 fill="#b9c1ac", font=("Segoe UI", 9, "bold"), tags="frame")
         self.draw_skill_dialogue()
         if self.active_quest:
@@ -2064,7 +3281,7 @@ class BattlefieldRPG:
                       font=("Segoe UI", 8, "bold"), tags="frame")
 
     def draw_region_select(self):
-        boss_kills = self.wave // 4
+        boss_kills = self.stage_number()
         choices = [
             (self.region + 1) % len(REGIONS),
             (self.region + 2) % len(REGIONS),
@@ -2098,12 +3315,12 @@ class BattlefieldRPG:
                                     fill="#d0d4c2", font=("Segoe UI", 10, "bold"),
                                     tags="frame")
         self.canvas.create_text(WIDTH / 2, 463,
-                                text=f"Boss skill acquired: {self.boss_skill()[0]}. Press 1 to use it.",
+                                text=f"Boss skill acquired: {self.boss_skill()[0]}. Cast skills directly with keys 1-5.",
                                 fill="#9fe0ce", font=("Segoe UI", 12, "bold"), tags="frame")
         if len(self.unlocked_abilities) > 1:
             skills = ", ".join(skill[0] for skill in self.unlocked_abilities)
             self.canvas.create_text(WIDTH / 2, 480,
-                                    text=f"Unlocked skills: {skills}. Press 2 to cycle.",
+                                    text=f"Unlocked skills: {skills}",
                                     fill="#c2c7b9", font=("Segoe UI", 9), tags="frame")
         self.canvas.create_text(WIDTH / 2, 495,
                                 text="Collect dropped coins by walking over them. Space or click to shoot.",
@@ -2151,9 +3368,54 @@ class BattlefieldRPG:
         c.create_text(WIDTH / 2, 365, text=f"ENTERING THE BATTLEFIELD  {remaining:.1f}",
                       fill="#c7c7c2", font=("Segoe UI", 13, "bold"), tags="frame")
 
+    def draw_minion_difficulty(self):
+        c = self.canvas
+        c.create_rectangle(0, 0, WIDTH, HEIGHT, fill="#101214",
+                           outline="", tags="frame")
+        c.create_text(
+            WIDTH / 2, 155, text="A DEMON MINION BLOCKS THE FLOOR",
+            fill="#e2a99a", font=("Segoe UI", 25, "bold"), tags="frame"
+        )
+        c.create_text(
+            WIDTH / 2, 205,
+            text="Choose its strength. Higher danger earns more coins.",
+            fill="#d0d4c2", font=("Segoe UI", 13), tags="frame"
+        )
+        for index, (name, health, reward) in enumerate(MINION_DIFFICULTIES):
+            x1 = 55 + index * 285
+            x2 = x1 + 255
+            c.create_rectangle(
+                x1, 260, x2, 430, fill="#35443d",
+                outline="#d4bd91", width=2, tags="frame"
+            )
+            c.create_text(
+                (x1 + x2) / 2, 300, text=f"{index + 1}. {name}",
+                fill="#f0dfb8", font=("Segoe UI", 15, "bold"), tags="frame"
+            )
+            c.create_text(
+                (x1 + x2) / 2, 345, text=f"{health:,} HP",
+                fill="#e2a99a", font=("Segoe UI", 17, "bold"), tags="frame"
+            )
+            c.create_text(
+                (x1 + x2) / 2, 385, text=f"REWARD  {reward:,} COINS",
+                fill="#e5c874", font=("Segoe UI", 11, "bold"), tags="frame"
+            )
+            c.create_text(
+                (x1 + x2) / 2, 414, text="CLICK TO CHOOSE",
+                fill="#c2c7b9", font=("Segoe UI", 8, "bold"), tags="frame"
+            )
+        c.create_text(
+            WIDTH / 2, 480, text="PRESS 1, 2, OR 3 TO CHOOSE",
+            fill="#c2c7b9", font=("Segoe UI", 10, "bold"), tags="frame"
+        )
+
     def draw_tower_exterior(self):
         c = self.canvas
         c.create_rectangle(0, 0, WIDTH, HEIGHT, fill="#121619", tags="frame")
+        c.create_rectangle(760, 20, 930, 58, fill="#35443d",
+                           outline="#d4bd91", tags="frame")
+        c.create_text(845, 39, text="FLOOR STAIRS  P",
+                      fill="#fff1d2", font=("Segoe UI", 9, "bold"), tags="frame")
         for x in range(0, WIDTH, 80):
             c.create_line(x, 0, WIDTH / 2, 370, fill="#20282a", width=2,
                           tags="frame")
@@ -2397,10 +3659,10 @@ class BattlefieldRPG:
             dialogue = "WELCOME TO MY WORLD OF DEATH AND DESIRE!"
         elif elapsed < 9:
             dialogue = ("YOU HAVE TO MAKE YOUR WAY FROM THE 1ST STAGE TO THE "
-                        "100TH FLOOR, WHERE MY MINION WILL FIGHT YOU WITH "
+                        "200TH FLOOR, WHERE MY MINION WILL FIGHT YOU WITH "
                         "50% OF MY ORIGINAL POWERS...")
         elif elapsed < 10.8:
-            dialogue = ("THEN, AFTER 100 MORE FLOORS, FIND AND DEFEAT ME "
+            dialogue = ("THEN, AFTER CLIMBING ALL 200 FLOORS, FIND AND DEFEAT ME "
                         "TO BECOME THE TOWER KING...")
         else:
             dialogue = "HELP!!"
@@ -2476,7 +3738,7 @@ class BattlefieldRPG:
     def draw_quest_select(self):
         self.canvas.create_rectangle(0, 0, WIDTH, HEIGHT, fill="#101718",
                                      stipple="gray50", outline="", tags="frame")
-        floor = min(100, self.stage_number())
+        floor = self.stage_number()
         self.canvas.create_text(WIDTH / 2, 105,
                                 text=f"FLOOR {floor}  -  CHOOSE A QUEST",
                                 fill="#f0d7c5", font=("Segoe UI", 27, "bold"),
@@ -2511,20 +3773,30 @@ class BattlefieldRPG:
 
     def draw_minion_reveal(self, now):
         remaining = max(0, self.boss_dialogue_until - now)
-        self.canvas.create_rectangle(100, 465, WIDTH - 100, 570,
-                                     fill="#101214", stipple="gray50",
-                                     outline="#d4bd91", width=2, tags="frame")
-        self.canvas.create_text(WIDTH / 2, 490, text="THE MINION'S CLUE",
-                                fill="#e5c874", font=("Segoe UI", 13, "bold"),
-                                tags="frame")
-        self.canvas.create_text(WIDTH / 2, 520, text=self.clue_dialogue,
-                                width=720, fill="#f0d7c5",
-                                font=("Segoe UI", 11, "bold"), tags="frame")
-        self.canvas.create_text(WIDTH / 2, 550,
-                                text=f"CLUES FOUND  {len(self.tower_clues)}/{len(TOWER_MINIONS)}"
-                                + (f"  -  {remaining:.1f}" if remaining else ""),
-                                fill="#c2c7b9", font=("Segoe UI", 9, "bold"),
-                                tags="frame")
+        corpse = self.boss_corpses[-1] if self.boss_corpses else None
+        x = corpse["x"] if corpse else WIDTH / 2
+        y = corpse["y"] if corpse else HEIGHT / 2
+        box_x = max(155, min(WIDTH - 155, x))
+        box_y = max(150, y - 120)
+        self.canvas.create_rectangle(
+            box_x - 150, box_y - 42, box_x + 150, box_y + 34,
+            fill="#101214", stipple="gray50",
+            outline="#d4bd91", width=2, tags="frame"
+        )
+        self.canvas.create_text(
+            box_x, box_y - 25, text="THE MINION'S CLUE",
+            fill="#e5c874", font=("Segoe UI", 10, "bold"), tags="frame"
+        )
+        self.canvas.create_text(
+            box_x, box_y + 1, text=self.clue_dialogue, width=278,
+            fill="#f0d7c5", font=("Segoe UI", 9, "bold"), tags="frame"
+        )
+        self.canvas.create_text(
+            box_x, box_y + 52,
+            text=f"CLUES FOUND  {len(self.tower_clues)}/{len(TOWER_MINIONS)}"
+            + (f"  -  {remaining:.1f}" if remaining else ""),
+            fill="#c2c7b9", font=("Segoe UI", 9, "bold"), tags="frame"
+        )
 
     def draw_kidnapper_reveal(self, now):
         elapsed = 6 - max(0, self.kidnapper_reveal_until - now)
@@ -2614,6 +3886,21 @@ class BattlefieldRPG:
 
     def draw_post_boss(self, now):
         remaining = max(0, self.travel_ready_at - now)
+        floor_coins = sum(
+            pickup["value"] for pickup in self.pickups
+            if pickup["kind"] == "coins"
+        )
+        collect_label = (
+            f"COLLECT ALL FLOOR COINS  +{floor_coins}"
+            if floor_coins else "ALL FLOOR COINS COLLECTED"
+        )
+        collect_color = "#53634d" if floor_coins else "#343b38"
+        self.canvas.create_rectangle(340, 465, 620, 500, fill=collect_color,
+                                     outline="#d4bd91", width=1, tags="frame")
+        self.canvas.create_text(
+            WIDTH / 2, 482, text=collect_label,
+            fill="#fff1d2", font=("Segoe UI", 9, "bold"), tags="frame"
+        )
         self.canvas.create_rectangle(96, 512, WIDTH - 96, 612,
                                      fill="#18201f", outline="#d4bd91",
                                      width=2, tags="frame")
@@ -2775,7 +4062,8 @@ class BattlefieldRPG:
         self.canvas.create_text(WIDTH / 2, 276, text="The frontline is waiting.",
                                 fill="#c2c7b9", font=("Segoe UI", 12), tags="frame")
         for y1, y2, label in ((320, 370, "RESUME  -  ESC"),
-                              (390, 440, "CHANGE CHARACTER  -  C")):
+                              (390, 440, "CHANGE CHARACTER  -  C"),
+                              (460, 510, "FLOOR PROGRESSION  -  P")):
             self.canvas.create_rectangle(370, y1, 590, y2, fill="#53634d",
                                          outline="#d4bd91", width=1, tags="frame")
             self.canvas.create_text(WIDTH / 2, (y1 + y2) / 2, text=label,
@@ -2864,11 +4152,58 @@ class BattlefieldRPG:
         self.canvas.create_text(WIDTH / 2, 356, text=action, fill="#fff1d2",
                                 font=("Segoe UI", 13, "bold"), tags="frame")
         self.canvas.create_text(WIDTH / 2, 430,
-                                text="WASD / ARROWS MOVE   SPACE / CLICK SHOOT   1 SKILL   2 CYCLE   ESC PAUSE",
+                                text="WASD / ARROWS MOVE   SPACE / CLICK SHOOT   1-5 CAST SKILLS   RIGHT-CLICK TO AIM   ESC PAUSE",
                                 fill="#b7c1b4", font=("Segoe UI", 10, "bold"), tags="frame")
         self.canvas.create_text(WIDTH / 2, 461,
                                 text="Defeat the warlords, claim new territories, and take their power.",
                                 fill="#9ea99d", font=("Segoe UI", 10), tags="frame")
+
+    def draw_main_menu(self):
+        self.canvas.create_rectangle(0, 0, WIDTH, HEIGHT, fill="#101718",
+                                     stipple="gray50", outline="", tags="frame")
+        self.canvas.create_text(WIDTH / 2, 220, text="WELCOME TO THE GAME!",
+                                fill="#e8d9b8", font=("Segoe UI", 31, "bold"),
+                                tags="frame")
+        self.canvas.create_text(
+            WIDTH / 2, 276,
+            text="DEFEAT MONSTERS, CLAIM TERRITORIES, AND TAKE THEIR POWER",
+            fill="#c2c7b9", font=("Segoe UI", 12), tags="frame"
+        )
+        has_save = self.has_save()
+        self.canvas.create_rectangle(325, 331, 635, 381,
+                                     fill="#a0784d" if has_save else "#53634d",
+                                     outline="#d4bd91", width=1, tags="frame")
+        self.canvas.create_text(
+            WIDTH / 2, 356,
+            text="CONTINUE  -  ENTER" if has_save else "DEPLOY  -  ENTER",
+            fill="#fff1d2", font=("Segoe UI", 13, "bold"), tags="frame"
+        )
+        if has_save:
+            self.canvas.create_rectangle(325, 398, 635, 448, fill="#35443d",
+                                         outline="#d4bd91", width=1, tags="frame")
+            self.canvas.create_text(WIDTH / 2, 423, text="NEW GAME",
+                                    fill="#fff1d2", font=("Segoe UI", 11, "bold"),
+                                    tags="frame")
+        self.canvas.create_text(
+            WIDTH / 2, 482,
+            text="WASD / ARROWS MOVE   SPACE / CLICK SHOOT   1-5 CAST SKILLS   ESC PAUSE",
+            fill="#b7c1b4", font=("Segoe UI", 10, "bold"), tags="frame"
+        )
+        self.canvas.create_text(
+            WIDTH / 2, 510,
+            text="CTRL+SHIFT+S SAVE NOW  |  GAME ALSO SAVES WHEN YOU CLOSE",
+            fill="#9ea99d", font=("Segoe UI", 9, "bold"), tags="frame"
+        )
+        if has_save:
+            self.canvas.create_rectangle(325, 455, 635, 500, fill="#35443d",
+                                         outline="#d4bd91", width=1, tags="frame")
+            self.canvas.create_text(WIDTH / 2, 477, text="FLOOR PROGRESSION",
+                                    fill="#fff1d2", font=("Segoe UI", 11, "bold"),
+                                    tags="frame")
+        if time.monotonic() < self.save_notice_until:
+            self.canvas.create_text(WIDTH / 2, 550, text=self.save_notice,
+                                    fill="#e5c874", font=("Segoe UI", 10, "bold"),
+                                    tags="frame")
 
     def tick(self):
         now = time.monotonic()
@@ -2888,11 +4223,7 @@ class BattlefieldRPG:
         else:
             self.canvas.delete("frame")
         if self.state == "menu":
-            self.draw_overlay(
-                "WELCOME TO THE GAME!",
-                "DEFEAT MONSTERS AND ENEMIES TO ACQUIRE SKILLS AND BECOME THE KING OF THE GAME!",
-                "DEPLOY  -  ENTER"
-            )
+            self.draw_main_menu()
         elif self.state == "tower_exterior":
             self.draw_tower_exterior()
         elif self.state == "opening_cutscene":
@@ -2906,6 +4237,8 @@ class BattlefieldRPG:
                                         tags="frame")
         elif self.state == "quest_select":
             self.draw_quest_select()
+        elif self.state == "minion_difficulty":
+            self.draw_minion_difficulty()
         elif self.state == "stage_intro":
             self.draw_stage_intro()
         elif self.state == "boss_warning":
@@ -2920,6 +4253,10 @@ class BattlefieldRPG:
             self.draw_shop()
         elif self.state == "region_map":
             self.draw_region_map()
+        elif self.state == "floor_progression":
+            self.draw_floor_progression()
+        elif self.state == "marketplace":
+            self.draw_marketplace()
         elif self.state == "paused":
             self.draw_paused()
         elif self.state == "character":

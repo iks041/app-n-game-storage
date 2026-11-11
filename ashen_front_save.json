@@ -1,0 +1,89 @@
+{
+  "version": 1,
+  "floor": 1,
+  "floor_wave": 4,
+  "floor_records": {
+    "1": {
+      "cleared": true,
+      "quest_index": 2,
+      "quest_title": "SWEEP THE FLOOR",
+      "quest_complete": true,
+      "stars": 3,
+      "quest_progress": 12,
+      "quest_target": 12,
+      "quest_reward": 70,
+      "kills": 31,
+      "level": 5,
+      "coins": 70
+    }
+  },
+  "owned_special_weapons": [],
+  "equipped_special_weapon": null,
+  "special_shots_left": 3,
+  "floor_kills_start": 0,
+  "active_quest_index": 2,
+  "quest_progress": 12,
+  "quest_complete": true,
+  "encounter_clear": true,
+  "minion_difficulty": null,
+  "player": {
+    "level": 6,
+    "xp": 98,
+    "next_xp": 253,
+    "speed": 205,
+    "max_hp": 180,
+    "hp": 180
+  },
+  "coins": 138,
+  "kills": 31,
+  "region": 0,
+  "territories": [
+    true,
+    false,
+    false,
+    false
+  ],
+  "unlocked_abilities": [
+    [
+      "Groundsplit",
+      "Earth, answer me! Groundsplit!",
+      "You have earned my Groundsplit. Make it count."
+    ]
+  ],
+  "active_ability": 0,
+  "weapon_upgrade": 0,
+  "skill_upgrade": 0,
+  "health_upgrade": 0,
+  "boss_weapon_owned": true,
+  "advanced_gun_owned": true,
+  "owned_cosmetics": {
+    "HAIR": [
+      "Close Crop"
+    ],
+    "GUN": [
+      "Service Rifle",
+      "Warden Breaker"
+    ],
+    "GLOVES": [
+      "Field Wraps"
+    ],
+    "MASK": [
+      "No Mask"
+    ],
+    "OUTFIT": [
+      "Scout Jacket"
+    ]
+  },
+  "equipped_cosmetics": {
+    "HAIR": "Close Crop",
+    "GUN": "Warden Breaker",
+    "GLOVES": "Field Wraps",
+    "MASK": "No Mask",
+    "OUTFIT": "Scout Jacket"
+  },
+  "quests_completed": [
+    1
+  ],
+  "tower_clues": [],
+  "rescue_route_unlocked": false
+}
