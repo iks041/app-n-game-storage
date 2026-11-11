@@ -365,6 +365,8 @@ class BattlefieldRPG:
         self.owned_special_weapons = []
         self.equipped_special_weapon = None
         self.special_shots_left = SPECIAL_SHOTS_PER_FLOOR
+        self.special_loadout_page = 0
+        self.special_loadout_return_state = "menu"
         self.kills = 0
         self.floor_kills_start = 0
         self.coins = 0
@@ -518,16 +520,21 @@ class BattlefieldRPG:
 
     def on_click(self, event):
         if self.state == "menu":
-            if 325 <= event.x <= 635 and 320 <= event.y <= 375:
+            if 165 <= event.x <= 465 and 331 <= event.y <= 381:
                 if self.has_save():
                     self.load_game()
                 else:
                     self.start_game()
-            elif self.has_save() and 325 <= event.x <= 635 and 392 <= event.y <= 442:
-                self.start_game()
-            elif self.has_save() and 325 <= event.x <= 635 and 455 <= event.y <= 500:
-                self.load_game()
+            elif 495 <= event.x <= 795 and 331 <= event.y <= 381:
+                if self.has_save():
+                    self.load_game()
                 self.open_floor_progression("menu")
+            elif self.has_save() and 165 <= event.x <= 465 and 398 <= event.y <= 448:
+                self.start_game()
+            elif 495 <= event.x <= 795 and 398 <= event.y <= 448:
+                if self.has_save():
+                    self.load_game()
+                self.open_special_loadout("menu")
             return
         if self.state == "tower_exterior":
             if 340 <= event.x <= 620 and 330 <= event.y <= 500:
@@ -598,6 +605,9 @@ class BattlefieldRPG:
             return
         if self.state == "marketplace":
             self.handle_market_click(event.x, event.y)
+            return
+        if self.state == "special_loadout":
+            self.handle_special_loadout_click(event.x, event.y)
             return
         if self.state == "post_boss":
             if 340 <= event.x <= 620 and 465 <= event.y <= 500:
@@ -708,8 +718,6 @@ class BattlefieldRPG:
                 return
             self.map_return_state = self.state
             self.state = "region_map"
-        elif key == "f" and not was_down and self.state == "playing":
-            self.cycle_special_weapon()
         elif key == "p" and not was_down and self.state in (
                 "playing", "paused", "tower_exterior"):
             self.open_floor_progression(self.state)
@@ -748,6 +756,8 @@ class BattlefieldRPG:
                 self.state = self.progression_return_state
             elif self.state == "marketplace":
                 self.state = "floor_progression"
+            elif self.state == "special_loadout":
+                self.state = self.special_loadout_return_state
             elif self.state == "character":
                 self.state = "paused"
             elif self.state == "auto_aim_prompt":
@@ -1298,6 +1308,33 @@ class BattlefieldRPG:
         self.market_search = ""
         self.state = "marketplace"
 
+    def open_special_loadout(self, return_state):
+        self.special_loadout_return_state = return_state
+        self.special_loadout_page = 0
+        self.state = "special_loadout"
+
+    def handle_special_loadout_click(self, x, y):
+        if y >= 555 and x <= 260:
+            self.state = self.special_loadout_return_state
+            return
+        if y >= 555 and x >= 690:
+            self.special_loadout_page += 1
+            return
+        if y >= 555 and 360 <= x <= 620:
+            self.special_loadout_page = max(0, self.special_loadout_page - 1)
+            return
+        if 125 <= y < 545 and 52 <= x <= 910:
+            row = (y - 125) // 42
+            start = self.special_loadout_page * 10
+            owned = self.owned_special_weapons[start:start + 10]
+            if 0 <= row < len(owned):
+                weapon_id = owned[row]
+                self.equipped_special_weapon = weapon_id
+                weapon = MARKET_WEAPONS[weapon_id]
+                self.message = f'{weapon["name"].upper()} EQUIPPED'
+                self.message_until = time.monotonic() + 2
+                self.save_game()
+
     def handle_progression_click(self, x, y):
         if y < 112 and 300 <= x <= 430:
             self.advance_progression_page(-1)
@@ -1362,29 +1399,15 @@ class BattlefieldRPG:
             if 0 <= index < len(visible):
                 weapon = visible[index]
                 if weapon["id"] in self.owned_special_weapons:
-                    self.equipped_special_weapon = weapon["id"]
-                    self.message = f'{weapon["name"].upper()} EQUIPPED'
+                    self.message = "OPEN SPECIAL WEAPONS TO EQUIP OWNED ITEMS"
                 elif self.coins >= weapon["price"]:
                     self.coins -= weapon["price"]
                     self.owned_special_weapons.append(weapon["id"])
-                    self.equipped_special_weapon = weapon["id"]
-                    self.message = f'{weapon["name"].upper()} PURCHASED AND EQUIPPED'
+                    self.message = f'{weapon["name"].upper()} PURCHASED  -  EQUIP IN SPECIAL WEAPONS'
                 else:
                     self.message = f'NOT ENOUGH COINS  -  NEED {weapon["price"]:,}'
                 self.message_until = time.monotonic() + 2
                 self.save_game()
-
-    def cycle_special_weapon(self):
-        if not self.owned_special_weapons:
-            self.message = "BUY A SPECIAL WEAPON AT A MARKET STAND"
-        else:
-            index = self.owned_special_weapons.index(self.equipped_special_weapon)
-            self.equipped_special_weapon = self.owned_special_weapons[
-                (index + 1) % len(self.owned_special_weapons)
-            ]
-            weapon = MARKET_WEAPONS[self.equipped_special_weapon]
-            self.message = f'{weapon["name"].upper()} SELECTED'
-        self.message_until = time.monotonic() + 2
 
     def fire_special_weapon(self, now, fx, fy):
         if self.special_shots_left <= 0 or self.equipped_special_weapon is None:
@@ -1519,6 +1542,9 @@ class BattlefieldRPG:
             self.save_game()
 
     def handle_character_click(self, x, y):
+        if 640 <= x <= 920 and 505 <= y <= 545:
+            self.open_special_loadout("character")
+            return
         if 70 <= x <= 260 and 550 <= y <= 600:
             self.state = "paused"
             return
@@ -2719,7 +2745,11 @@ class BattlefieldRPG:
             y = 122 + row * 43
             owned = weapon["id"] in self.owned_special_weapons
             equipped = weapon["id"] == self.equipped_special_weapon
-            status = "EQUIPPED" if equipped else ("EQUIP" if owned else f"BUY {weapon['price']:,}")
+            status = (
+                "EQUIPPED" if equipped
+                else ("OWNED - EQUIP IN SPECIAL WEAPONS" if owned
+                      else f"BUY {weapon['price']:,}")
+            )
             c.create_rectangle(52, y, 908, y + 37, fill="#29332f",
                                outline="#69766b", tags="frame")
             c.create_text(72, y + 18, anchor="w",
@@ -2950,7 +2980,7 @@ class BattlefieldRPG:
             special_weapon = MARKET_WEAPONS[self.equipped_special_weapon]
             self.canvas.create_text(
                 600, 51,
-                text=f"SPECIAL: {special_weapon['name']}  {self.special_shots_left}/3  [F]",
+                text=f"SPECIAL: {special_weapon['name']}  {self.special_shots_left}/3",
                 anchor="w", fill="#8ee5f0",
                 font=("Segoe UI", 8, "bold"), tags="frame"
             )
@@ -4048,10 +4078,85 @@ class BattlefieldRPG:
         self.canvas.create_text(165, 575, text="BACK TO PAUSE",
                                 fill="#fff1d2", font=("Segoe UI", 10, "bold"),
                                 tags="frame")
+        self.canvas.create_rectangle(640, 505, 920, 545, fill="#35443d",
+                                     outline="#d4bd91", width=1, tags="frame")
+        equipped_special = (
+            MARKET_WEAPONS[self.equipped_special_weapon]["name"]
+            if self.equipped_special_weapon is not None else "NONE"
+        )
+        self.canvas.create_text(
+            780, 525, text=f"SPECIAL WEAPONS  -  {equipped_special}",
+            fill="#8ee5f0", font=("Segoe UI", 9, "bold"), tags="frame"
+        )
         if time.monotonic() < self.message_until:
             self.canvas.create_text(770, 470, text=self.message,
                                     fill="#e5c874", font=("Segoe UI", 10, "bold"),
                                     tags="frame")
+
+    def draw_special_loadout(self):
+        c = self.canvas
+        c.create_rectangle(0, 0, WIDTH, HEIGHT, fill="#101718", tags="frame")
+        c.create_text(WIDTH / 2, 40, text="SPECIAL WEAPONS",
+                      fill="#f0d7c5", font=("Segoe UI", 25, "bold"), tags="frame")
+        equipped = (
+            MARKET_WEAPONS[self.equipped_special_weapon]
+            if self.equipped_special_weapon is not None else None
+        )
+        equipped_label = (
+            f'EQUIPPED: {equipped["name"]} [{equipped["type"]}]'
+            if equipped else "EQUIPPED: NONE"
+        )
+        c.create_text(WIDTH / 2, 78,
+                      text=f"{equipped_label}  |  {len(self.owned_special_weapons)} OWNED",
+                      fill="#8ee5f0", font=("Segoe UI", 11, "bold"), tags="frame")
+
+        per_page = 10
+        pages = max(1, (len(self.owned_special_weapons) + per_page - 1) // per_page)
+        self.special_loadout_page = min(self.special_loadout_page, pages - 1)
+        start = self.special_loadout_page * per_page
+        visible = self.owned_special_weapons[start:start + per_page]
+        if not visible:
+            c.create_text(WIDTH / 2, 280,
+                          text="NO SPECIAL WEAPONS OWNED YET",
+                          fill="#c2c7b9", font=("Segoe UI", 16, "bold"), tags="frame")
+            c.create_text(WIDTH / 2, 320,
+                          text="Unlock a market stand from the floor progression screen to buy some.",
+                          fill="#929c93", font=("Segoe UI", 10), tags="frame")
+        for row, weapon_id in enumerate(visible):
+            weapon = MARKET_WEAPONS[weapon_id]
+            y = 125 + row * 42
+            is_equipped = weapon_id == self.equipped_special_weapon
+            c.create_rectangle(52, y, 908, y + 36,
+                               fill="#46523e" if is_equipped else "#29332f",
+                               outline="#e5c874" if is_equipped else "#69766b",
+                               width=2 if is_equipped else 1, tags="frame")
+            c.create_text(
+                72, y + 18, anchor="w",
+                text=f'{weapon["id"] + 1:04d}  {weapon["name"]}  [{weapon["type"]}]',
+                fill="#f0d7c5", font=("Segoe UI", 10, "bold"), tags="frame"
+            )
+            c.create_text(
+                885, y + 18, anchor="e",
+                text="EQUIPPED" if is_equipped else "CLICK TO EQUIP",
+                fill="#e5c874", font=("Segoe UI", 9, "bold"), tags="frame"
+            )
+
+        controls = (
+            (40, 230, "BACK"),
+            (365, 620, f"PAGE {self.special_loadout_page + 1}/{pages}  -  PREVIOUS"),
+            (700, 920, "NEXT PAGE"),
+        )
+        for x1, x2, label in controls:
+            c.create_rectangle(x1, 565, x2, 605, fill="#35443d",
+                               outline="#d4bd91", tags="frame")
+            c.create_text((x1 + x2) / 2, 585, text=label,
+                          fill="#fff1d2", font=("Segoe UI", 9, "bold"), tags="frame")
+        c.create_text(WIDTH / 2, 630,
+                      text="SPECIAL WEAPONS ARE SEPARATE FROM NORMAL CHARACTER GUN COSMETICS",
+                      fill="#aeb6aa", font=("Segoe UI", 9, "bold"), tags="frame")
+        if time.monotonic() < self.message_until:
+            c.create_text(WIDTH / 2, 530, text=self.message,
+                          fill="#e5c874", font=("Segoe UI", 10, "bold"), tags="frame")
 
     def draw_paused(self):
         self.canvas.create_rectangle(0, 0, WIDTH, HEIGHT, fill="#101718",
@@ -4170,20 +4275,31 @@ class BattlefieldRPG:
             fill="#c2c7b9", font=("Segoe UI", 12), tags="frame"
         )
         has_save = self.has_save()
-        self.canvas.create_rectangle(325, 331, 635, 381,
+        self.canvas.create_rectangle(165, 331, 465, 381,
                                      fill="#a0784d" if has_save else "#53634d",
                                      outline="#d4bd91", width=1, tags="frame")
         self.canvas.create_text(
-            WIDTH / 2, 356,
+            315, 356,
             text="CONTINUE  -  ENTER" if has_save else "DEPLOY  -  ENTER",
             fill="#fff1d2", font=("Segoe UI", 13, "bold"), tags="frame"
         )
+        self.canvas.create_rectangle(495, 331, 795, 381, fill="#35443d",
+                                     outline="#d4bd91", width=1, tags="frame")
+        self.canvas.create_text(645, 356, text="FLOOR PROGRESSION",
+                                fill="#fff1d2", font=("Segoe UI", 11, "bold"),
+                                tags="frame")
         if has_save:
-            self.canvas.create_rectangle(325, 398, 635, 448, fill="#35443d",
+            self.canvas.create_rectangle(165, 398, 465, 448, fill="#35443d",
                                          outline="#d4bd91", width=1, tags="frame")
-            self.canvas.create_text(WIDTH / 2, 423, text="NEW GAME",
+            self.canvas.create_text(315, 423, text="NEW GAME",
                                     fill="#fff1d2", font=("Segoe UI", 11, "bold"),
                                     tags="frame")
+        self.canvas.create_rectangle(495, 398, 795, 448, fill="#35443d",
+                                     outline="#d4bd91", width=1, tags="frame")
+        self.canvas.create_text(
+            645, 423, text=f"SPECIAL WEAPONS  ({len(self.owned_special_weapons)} OWNED)",
+            fill="#8ee5f0", font=("Segoe UI", 10, "bold"), tags="frame"
+        )
         self.canvas.create_text(
             WIDTH / 2, 482,
             text="WASD / ARROWS MOVE   SPACE / CLICK SHOOT   1-5 CAST SKILLS   ESC PAUSE",
@@ -4194,12 +4310,6 @@ class BattlefieldRPG:
             text="CTRL+SHIFT+S SAVE NOW  |  GAME ALSO SAVES WHEN YOU CLOSE",
             fill="#9ea99d", font=("Segoe UI", 9, "bold"), tags="frame"
         )
-        if has_save:
-            self.canvas.create_rectangle(325, 455, 635, 500, fill="#35443d",
-                                         outline="#d4bd91", width=1, tags="frame")
-            self.canvas.create_text(WIDTH / 2, 477, text="FLOOR PROGRESSION",
-                                    fill="#fff1d2", font=("Segoe UI", 11, "bold"),
-                                    tags="frame")
         if time.monotonic() < self.save_notice_until:
             self.canvas.create_text(WIDTH / 2, 550, text=self.save_notice,
                                     fill="#e5c874", font=("Segoe UI", 10, "bold"),
@@ -4257,6 +4367,8 @@ class BattlefieldRPG:
             self.draw_floor_progression()
         elif self.state == "marketplace":
             self.draw_marketplace()
+        elif self.state == "special_loadout":
+            self.draw_special_loadout()
         elif self.state == "paused":
             self.draw_paused()
         elif self.state == "character":
