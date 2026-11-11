@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "floor": 1,
+  "floor": 5,
   "floor_wave": 4,
   "floor_records": {
     "1": {
@@ -15,31 +15,86 @@
       "kills": 31,
       "level": 5,
       "coins": 70
+    },
+    "2": {
+      "cleared": true,
+      "quest_index": 2,
+      "quest_title": "SWEEP THE FLOOR",
+      "quest_complete": true,
+      "stars": 3,
+      "quest_progress": 12,
+      "quest_target": 12,
+      "quest_reward": 88,
+      "kills": 37,
+      "level": 8,
+      "coins": 121
+    },
+    "3": {
+      "cleared": true,
+      "quest_index": 2,
+      "quest_title": "SWEEP THE FLOOR",
+      "quest_complete": true,
+      "stars": 3,
+      "quest_progress": 12,
+      "quest_target": 12,
+      "quest_reward": 109,
+      "kills": 43,
+      "level": 9,
+      "coins": 154
+    },
+    "4": {
+      "cleared": true,
+      "quest_index": 2,
+      "quest_title": "SWEEP THE FLOOR",
+      "quest_complete": true,
+      "stars": 3,
+      "quest_progress": 12,
+      "quest_target": 12,
+      "quest_reward": 137,
+      "kills": 49,
+      "level": 10,
+      "coins": 193
+    },
+    "5": {
+      "cleared": true,
+      "quest_index": 2,
+      "quest_title": "SWEEP THE FLOOR",
+      "quest_complete": true,
+      "stars": 3,
+      "quest_progress": 12,
+      "quest_target": 12,
+      "quest_reward": 171,
+      "kills": 55,
+      "level": 12,
+      "coins": 465
     }
   },
   "owned_special_weapons": [],
   "equipped_special_weapon": null,
   "special_shots_left": 3,
-  "floor_kills_start": 0,
+  "floor_kills_start": 251,
   "active_quest_index": 2,
   "quest_progress": 12,
   "quest_complete": true,
   "encounter_clear": true,
   "minion_difficulty": null,
+  "replay_active": false,
+  "replay_return_snapshot": null,
+  "progression_return_state": "paused",
   "player": {
-    "level": 6,
-    "xp": 98,
-    "next_xp": 253,
-    "speed": 205,
-    "max_hp": 180,
-    "hp": 180
+    "level": 12,
+    "xp": 495,
+    "next_xp": 2338,
+    "speed": 223,
+    "max_hp": 376,
+    "hp": 376
   },
-  "coins": 138,
-  "kills": 31,
+  "coins": 465,
+  "kills": 306,
   "region": 0,
   "territories": [
     true,
-    false,
+    true,
     false,
     false
   ],
@@ -48,12 +103,39 @@
       "Groundsplit",
       "Earth, answer me! Groundsplit!",
       "You have earned my Groundsplit. Make it count."
+    ],
+    [
+      "Ember Volley",
+      "Burn bright! Ember Volley!",
+      "The Ember Volley is yours. Aim true, little spark."
+    ],
+    [
+      "Time Freeze",
+      "Time, stand still! Time Freeze!",
+      "Time bends to my will. Use the pause to strike."
+    ]
+  ],
+  "equipped_abilities": [
+    [
+      "Groundsplit",
+      "Earth, answer me! Groundsplit!",
+      "You have earned my Groundsplit. Make it count."
+    ],
+    [
+      "Ember Volley",
+      "Burn bright! Ember Volley!",
+      "The Ember Volley is yours. Aim true, little spark."
+    ],
+    [
+      "Time Freeze",
+      "Time, stand still! Time Freeze!",
+      "Time bends to my will. Use the pause to strike."
     ]
   ],
   "active_ability": 0,
-  "weapon_upgrade": 0,
-  "skill_upgrade": 0,
-  "health_upgrade": 0,
+  "weapon_upgrade": 4,
+  "skill_upgrade": 7,
+  "health_upgrade": 4,
   "boss_weapon_owned": true,
   "advanced_gun_owned": true,
   "owned_cosmetics": {
@@ -82,7 +164,11 @@
     "OUTFIT": "Scout Jacket"
   },
   "quests_completed": [
-    1
+    1,
+    2,
+    3,
+    4,
+    5
   ],
   "tower_clues": [],
   "rescue_route_unlocked": false

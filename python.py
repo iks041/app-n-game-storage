@@ -64,6 +64,15 @@ MILESTONE_BOSS_SKILLS = (
 ALL_BOSS_SKILLS = BOSS_SKILLS + MILESTONE_BOSS_SKILLS
 MAX_ABILITIES = 5
 TARGETED_SKILLS = frozenset(("Ice Stars", "Epic Fall"))
+SKILL_DAMAGE_RANGE = {
+    "Groundsplit": (130, 320),
+    "Frost Nova": (85, 235),
+    "Ember Volley": (350, 460),
+    "Ironbark Guard": (60, 325),
+    "Time Freeze": (100, 400),
+    "Ice Stars": (310, 90),
+    "Epic Fall": (175, 105),
+}
 SAVE_VERSION = 1
 MINION_DIFFICULTIES = (
     ("SCOUT", 100_000, 200),
@@ -72,6 +81,7 @@ MINION_DIFFICULTIES = (
 )
 MARKET_WEAPON_COUNT = 1_000
 SPECIAL_SHOTS_PER_FLOOR = 3
+AUTO_SAVE_INTERVAL = 10
 MARKET_WEAPONS = tuple(
     {
         "id": index,
@@ -351,6 +361,8 @@ class BattlefieldRPG:
         self.floor_number = 1
         self.floor_wave = 1
         self.encounter_clear = False
+        self.replay_active = False
+        self.replay_return_snapshot = None
         self.wave_left = 0
         self.wave_pause = 0
         self.minion_difficulty = None
@@ -367,6 +379,14 @@ class BattlefieldRPG:
         self.special_shots_left = SPECIAL_SHOTS_PER_FLOOR
         self.special_loadout_page = 0
         self.special_loadout_return_state = "menu"
+        self.special_loadout_tab = "weapons"
+        self.skill_copies = []
+        self.crafted_skill_data = {}
+        self.next_crafted_skill_id = 1
+        self.forge_selected_skills = []
+        self.forge_page = 0
+        self.evolved = False
+        self.last_autosave_at = time.monotonic()
         self.kills = 0
         self.floor_kills_start = 0
         self.coins = 0
@@ -376,6 +396,7 @@ class BattlefieldRPG:
         self.territories[0] = True
         self.has_boss_ability = False
         self.unlocked_abilities = []
+        self.equipped_abilities = []
         self.active_ability = 0
         self.ability_cooldowns = {}
         self.pending_target_ability = None
@@ -428,6 +449,7 @@ class BattlefieldRPG:
     def is_minion_boss_wave(self):
         return (
             not self.rescue_battle
+            and self.stage_number() >= 15
             and self.stage_number() % 5 == 0
             and self.floor_wave == self.regular_waves_per_floor() + 1
         )
@@ -435,7 +457,7 @@ class BattlefieldRPG:
     def floor_wave_count(self, floor=None):
         floor = self.stage_number() if floor is None else floor
         return self.regular_waves_per_floor(floor) + (
-            2 if floor % 5 == 0 else 1
+            2 if floor >= 15 and floor % 5 == 0 else 1
         )
 
     def begin_floor(self, floor):
@@ -518,6 +540,104 @@ class BattlefieldRPG:
             return MILESTONE_BOSS_SKILLS[milestone - 1]
         return BOSS_SKILLS[(self.stage_number() - 1) % len(BOSS_SKILLS)]
 
+    def boss_skills(self):
+        primary = self.boss_skill()
+        if not self.is_minion_boss_wave() or self.rescue_battle:
+            return [primary]
+        primary_index = ALL_BOSS_SKILLS.index(primary)
+        return [primary, ALL_BOSS_SKILLS[(primary_index + 1) % len(ALL_BOSS_SKILLS)]]
+
+    def has_all_boss_skills(self):
+        return all(skill in self.unlocked_abilities for skill in ALL_BOSS_SKILLS)
+
+    def player_radius(self):
+        return 20 if self.evolved else 15
+
+    def apply_evolution(self, save=True, heal=True):
+        if not self.has_all_boss_skills():
+            return False
+        self.evolved = True
+        self.player.update({
+            "level": 100,
+            "xp": 0,
+            "next_xp": 40,
+            "max_hp": 100_000,
+            "hp": 100_000 if heal else min(self.player["hp"], 100_000),
+        })
+        self.weapon_upgrade = 100
+        self.skill_upgrade = 100
+        self.health_upgrade = 100
+        self.message = "EVOLUTION COMPLETE  -  LEVEL 100 POWER AWAKENED"
+        self.message_until = time.monotonic() + 4
+        if save:
+            self.save_game()
+        return True
+
+    def skill_damage_range(self, skill):
+        if skill[0] in self.crafted_skill_data:
+            data = self.crafted_skill_data[skill[0]]
+            return data["damage"], data["range"]
+        return SKILL_DAMAGE_RANGE[skill[0]]
+
+    def visible_skill_copies(self):
+        counts = {}
+        for skill in self.skill_copies:
+            counts[skill] = counts.get(skill, 0) + 1
+        return list(counts.items())
+
+    def open_skill_forge(self):
+        self.forge_selected_skills = []
+        self.forge_page = 0
+        self.state = "skill_forge"
+
+    def craft_selected_skills(self):
+        if len(self.forge_selected_skills) != 2:
+            return
+        skill_by_name = {
+            skill[0]: skill for skill in self.unlocked_abilities
+        }
+        if any(name not in skill_by_name for name in self.forge_selected_skills):
+            return
+        for skill_name in set(self.forge_selected_skills):
+            required = self.forge_selected_skills.count(skill_name)
+            available = sum(copy[0] == skill_name for copy in self.skill_copies)
+            if available < required:
+                self.message = f"NOT ENOUGH {skill_name.upper()} COPIES"
+                self.message_until = time.monotonic() + 2
+                return
+        ingredients = [
+            skill_by_name[name] for name in self.forge_selected_skills
+        ]
+        damage_and_range = [self.skill_damage_range(skill) for skill in ingredients]
+        damage = sum(values[0] for values in damage_and_range)
+        skill_range = sum(values[1] for values in damage_and_range)
+        for ingredient in ingredients:
+            self.skill_copies.remove(ingredient)
+        skill_name = f"Fusion {self.next_crafted_skill_id:03d}"
+        self.next_crafted_skill_id += 1
+        crafted_skill = (
+            skill_name,
+            f"Unleash the combined power of {ingredients[0][0]} and {ingredients[1][0]}!",
+            "A custom technique forged from two boss skills.",
+        )
+        self.crafted_skill_data[skill_name] = {
+            "damage": damage,
+            "range": skill_range,
+        }
+        self.skill_copies.append(crafted_skill)
+        self.unlocked_abilities.append(crafted_skill)
+        if len(self.equipped_abilities) < MAX_ABILITIES:
+            self.equipped_abilities.append(crafted_skill)
+        self.has_boss_ability = bool(self.equipped_abilities)
+        self.ability_cooldowns.setdefault(skill_name, 0)
+        self.forge_selected_skills = []
+        self.message = (
+            f"{skill_name.upper()} FORGED  -  {damage} DAMAGE / "
+            f"{skill_range} RANGE"
+        )
+        self.message_until = time.monotonic() + 3
+        self.save_game()
+
     def on_click(self, event):
         if self.state == "menu":
             if 165 <= event.x <= 465 and 331 <= event.y <= 381:
@@ -591,6 +711,8 @@ class BattlefieldRPG:
                 self.state = "character"
             elif 370 <= event.x <= 590 and 460 <= event.y <= 510:
                 self.open_floor_progression("paused")
+            elif 370 <= event.x <= 590 and 530 <= event.y <= 580:
+                self.restart_floor()
             return
         if self.state == "shop":
             self.handle_shop_click(event.x, event.y)
@@ -605,6 +727,9 @@ class BattlefieldRPG:
             return
         if self.state == "marketplace":
             self.handle_market_click(event.x, event.y)
+            return
+        elif self.state == "skill_forge":
+            self.handle_skill_forge_click(event.x, event.y)
             return
         if self.state == "special_loadout":
             self.handle_special_loadout_click(event.x, event.y)
@@ -666,8 +791,8 @@ class BattlefieldRPG:
                 time.monotonic(), ability_index, event.x, event.y
             )
             return
-        if 0 <= self.active_ability < len(self.unlocked_abilities):
-            skill_name = self.unlocked_abilities[self.active_ability][0]
+        if 0 <= self.active_ability < len(self.equipped_abilities):
+            skill_name = self.equipped_abilities[self.active_ability][0]
             if skill_name in TARGETED_SKILLS:
                 self.use_boss_ability(
                     time.monotonic(), self.active_ability, event.x, event.y
@@ -708,6 +833,19 @@ class BattlefieldRPG:
             self.restart_stage()
         elif key in ("1", "2", "3", "4", "5") and not was_down and self.state == "playing":
             self.use_boss_ability(time.monotonic(), int(key) - 1)
+        elif key == "t" and not was_down and self.state in ("playing", "post_boss"):
+            if self.evolved:
+                self.message = "EVOLUTION POWER IS ALREADY AWAKENED"
+                self.message_until = time.monotonic() + 2
+            elif self.apply_evolution():
+                self.message = "EVOLUTION COMPLETE  -  LEVEL 100 POWER AWAKENED"
+                self.message_until = time.monotonic() + 4
+            else:
+                self.message = (
+                    f"EVOLUTION LOCKED  -  LEARN ALL 7 SKILLS "
+                    f"({sum(skill in self.unlocked_abilities for skill in ALL_BOSS_SKILLS)}/7)"
+                )
+                self.message_until = time.monotonic() + 2.5
         elif key in ("1", "2", "3") and not was_down and self.state == "minion_difficulty":
             self.select_minion_difficulty(int(key) - 1)
         elif key == "m" and not was_down and self.state in ("playing", "post_boss"):
@@ -726,6 +864,8 @@ class BattlefieldRPG:
                 self.market_search = self.market_search[:-1]
             else:
                 self.state = "floor_progression"
+        elif self.state == "skill_forge" and key == "escape":
+            self.state = "marketplace"
         elif self.state == "marketplace" and len(key) == 1 and key.isprintable():
             self.market_search += key
         elif key == "b" and not was_down and self.state == "post_boss":
@@ -756,6 +896,8 @@ class BattlefieldRPG:
                 self.state = self.progression_return_state
             elif self.state == "marketplace":
                 self.state = "floor_progression"
+            elif self.state == "skill_forge":
+                self.state = "marketplace"
             elif self.state == "special_loadout":
                 self.state = self.special_loadout_return_state
             elif self.state == "character":
@@ -805,12 +947,20 @@ class BattlefieldRPG:
             "quest_complete": self.quest_complete,
             "encounter_clear": self.encounter_clear,
             "minion_difficulty": self.minion_difficulty,
+            "replay_active": self.replay_active,
+            "replay_return_snapshot": self.replay_return_snapshot,
+            "progression_return_state": self.progression_return_state,
             "player": {field: self.player[field] for field in player_fields},
             "coins": self.coins,
             "kills": self.kills,
             "region": self.region,
             "territories": self.territories,
             "unlocked_abilities": self.unlocked_abilities,
+            "equipped_abilities": self.equipped_abilities,
+            "skill_copies": self.skill_copies,
+            "crafted_skill_data": self.crafted_skill_data,
+            "next_crafted_skill_id": self.next_crafted_skill_id,
+            "evolved": self.evolved,
             "active_ability": self.active_ability,
             "weapon_upgrade": self.weapon_upgrade,
             "skill_upgrade": self.skill_upgrade,
@@ -839,9 +989,17 @@ class BattlefieldRPG:
         else:
             self.save_notice = f"GAME SAVED  -  FLOOR {data['floor']}"
         self.save_notice_until = time.monotonic() + 3
+        self.last_autosave_at = time.monotonic()
         if notify:
             self.message = self.save_notice
             self.message_until = self.save_notice_until
+
+    def autosave_if_due(self, now):
+        if (self.state == "menu"
+                or now - self.last_autosave_at < AUTO_SAVE_INTERVAL):
+            return False
+        self.save_game()
+        return True
 
     def load_game(self):
         try:
@@ -878,17 +1036,60 @@ class BattlefieldRPG:
                 raise ValueError("Invalid territories")
             territories = territories.copy()
             territories[region] = True
+            crafted_skill_data = data.get("crafted_skill_data", {})
+            if not isinstance(crafted_skill_data, dict):
+                raise ValueError("Invalid crafted skills")
+            valid_crafted_skill_data = {}
+            for name, metadata in crafted_skill_data.items():
+                if (isinstance(name, str) and name.startswith("Fusion ")
+                        and isinstance(metadata, dict)
+                        and isinstance(metadata.get("damage"), int)
+                        and metadata["damage"] > 0
+                        and isinstance(metadata.get("range"), int)
+                        and metadata["range"] > 0):
+                    valid_crafted_skill_data[name] = {
+                        "damage": metadata["damage"],
+                        "range": metadata["range"],
+                    }
             if not isinstance(data["unlocked_abilities"], list):
                 raise ValueError("Invalid saved skills")
             unlocked_abilities = []
             for skill in data["unlocked_abilities"]:
-                if isinstance(skill, list) and tuple(skill) in ALL_BOSS_SKILLS:
+                if (isinstance(skill, list) and len(skill) == 3
+                        and isinstance(skill[0], str)
+                        and (tuple(skill) in ALL_BOSS_SKILLS
+                             or tuple(skill)[0] in valid_crafted_skill_data)
+                        and tuple(skill) not in unlocked_abilities):
                     unlocked_abilities.append(tuple(skill))
-            if len(unlocked_abilities) > MAX_ABILITIES:
-                unlocked_abilities = unlocked_abilities[-MAX_ABILITIES:]
+            skill_copies_data = data.get("skill_copies")
+            if skill_copies_data is None:
+                skill_copies = unlocked_abilities.copy()
+            elif isinstance(skill_copies_data, list):
+                skill_copies = [
+                    tuple(skill) for skill in skill_copies_data
+                    if isinstance(skill, list) and len(skill) == 3
+                    and isinstance(skill[0], str)
+                    and (tuple(skill) in ALL_BOSS_SKILLS
+                         or tuple(skill)[0] in valid_crafted_skill_data)
+                ]
+            else:
+                raise ValueError("Invalid boss skill copies")
+            saved_equipped_abilities = data.get("equipped_abilities")
+            if saved_equipped_abilities is None:
+                equipped_abilities = unlocked_abilities[:MAX_ABILITIES]
+            elif isinstance(saved_equipped_abilities, list):
+                equipped_abilities = []
+                for skill in saved_equipped_abilities:
+                    if (isinstance(skill, list)
+                            and tuple(skill) in unlocked_abilities
+                            and tuple(skill) not in equipped_abilities
+                            and len(equipped_abilities) < MAX_ABILITIES):
+                        equipped_abilities.append(tuple(skill))
+            else:
+                raise ValueError("Invalid equipped boss skills")
             active_ability = max(
-                0, min(int(data["active_ability"]), len(unlocked_abilities) - 1)
-            ) if unlocked_abilities else 0
+                0, min(int(data["active_ability"]), len(equipped_abilities) - 1)
+            ) if equipped_abilities else 0
             upgrades = {
                 field: max(0, int(data[field]))
                 for field in ("weapon_upgrade", "skill_upgrade", "health_upgrade")
@@ -922,7 +1123,7 @@ class BattlefieldRPG:
                 str(record_floor): record
                 for record_floor, record in floor_records.items()
                 if str(record_floor).isdigit()
-                and 1 <= int(record_floor) <= floor
+                and 1 <= int(record_floor) <= MAX_FLOORS
                 and isinstance(record, dict)
             }
             owned_weapons = data.get("owned_special_weapons", [])
@@ -947,10 +1148,21 @@ class BattlefieldRPG:
             self.region = region
             self.territories = territories
             self.unlocked_abilities = unlocked_abilities
-            self.has_boss_ability = bool(unlocked_abilities)
+            self.equipped_abilities = equipped_abilities
+            self.skill_copies = skill_copies
+            self.crafted_skill_data = valid_crafted_skill_data
+            self.next_crafted_skill_id = max(
+                1, int(data.get("next_crafted_skill_id", 1))
+            )
+            self.evolved = bool(data.get("evolved", False))
+            self.has_boss_ability = bool(equipped_abilities)
             self.active_ability = active_ability
             for field, value in upgrades.items():
                 setattr(self, field, value)
+            if self.evolved and self.has_all_boss_skills():
+                self.apply_evolution(save=False, heal=False)
+            else:
+                self.evolved = False
             self.boss_weapon_owned = bool(data["boss_weapon_owned"])
             self.advanced_gun_owned = bool(data["advanced_gun_owned"])
             self.owned_cosmetics = owned_cosmetics
@@ -963,6 +1175,31 @@ class BattlefieldRPG:
                 1, min(int(data.get("floor_wave", 1)), self.floor_wave_count(floor))
             )
             self.encounter_clear = bool(data.get("encounter_clear", False))
+            replay_active = bool(data.get("replay_active", False))
+            replay_snapshot = data.get("replay_return_snapshot")
+            if replay_active and not isinstance(replay_snapshot, dict):
+                raise ValueError("Invalid floor replay state")
+            progression_return_state = data.get(
+                "progression_return_state", "menu"
+            )
+            if progression_return_state not in (
+                    "menu", "paused", "post_boss", "tower_exterior"):
+                progression_return_state = "menu"
+            if replay_active:
+                snapshot_floor = replay_snapshot.get("floor")
+                snapshot_wave = replay_snapshot.get("floor_wave")
+                snapshot_quest = replay_snapshot.get("quest_index")
+                if (not isinstance(snapshot_floor, int)
+                        or not 1 <= snapshot_floor <= MAX_FLOORS
+                        or not isinstance(snapshot_wave, int)
+                        or not 1 <= snapshot_wave <= self.floor_wave_count(snapshot_floor)
+                        or (snapshot_quest is not None
+                            and (not isinstance(snapshot_quest, int)
+                                 or not 0 <= snapshot_quest < len(QUEST_OPTIONS)))):
+                    raise ValueError("Invalid floor replay return snapshot")
+            self.replay_active = replay_active
+            self.replay_return_snapshot = replay_snapshot if replay_active else None
+            self.progression_return_state = progression_return_state
             minion_difficulty = data.get("minion_difficulty")
             self.minion_difficulty = (
                 minion_difficulty
@@ -1067,6 +1304,9 @@ class BattlefieldRPG:
 
     def restart_stage(self):
         self.floor_wave = 1
+        self.encounter_clear = False
+        self.minion_difficulty = None
+        self.special_shots_left = SPECIAL_SHOTS_PER_FLOOR
         self.player.update(
             x=WIDTH / 2,
             y=(ARENA[1] + ARENA[3]) / 2,
@@ -1082,6 +1322,8 @@ class BattlefieldRPG:
         self.pickups.clear()
         self.projectiles.clear()
         self.effects.clear()
+        self.boss_corpses.clear()
+        self.boss_chests.clear()
         self.wave_pause = 0
         self.pending_skill = None
         self.skill_acquire_progress = 0
@@ -1099,6 +1341,13 @@ class BattlefieldRPG:
         self.message = f"{self.stage_label()} RESTARTED"
         self.message_until = self.stage_intro_until
         self.last_tick = time.monotonic()
+        self.save_game()
+
+    def restart_floor(self):
+        if self.active_quest is not None and not self.quest_complete:
+            self.quest_progress = 0
+        self.floor_kills_start = self.kills
+        self.restart_stage()
 
     def spawn_enemy(self):
         if self.floor_wave > self.regular_waves_per_floor():
@@ -1162,7 +1411,7 @@ class BattlefieldRPG:
                 difficulty = 0
             base_hp = MINION_DIFFICULTIES[difficulty][1]
         else:
-            base_hp = 1_000 + (floor - 1) * 9_000
+            base_hp = 1_000 + (floor - 1) * 5_000
         self.enemies.append(
             {
                 "x": x,
@@ -1182,6 +1431,8 @@ class BattlefieldRPG:
                 "special_line": None,
                 "boss_name": self.boss_name(),
                 "skill": None if is_rescue_boss else self.boss_skill(),
+                "skills": [] if is_rescue_boss else self.boss_skills(),
+                "next_skill_index": 0,
                 "clue": minion_clue,
                 "difficulty": difficulty if is_minion_boss else None,
                 "floor_final_boss": self.floor_wave == self.floor_wave_count(),
@@ -1242,6 +1493,40 @@ class BattlefieldRPG:
                 self.message = "CHOOSE THE DEMON MINION'S DIFFICULTY"
             self.save_game()
             return
+        if self.replay_active:
+            snapshot = self.replay_return_snapshot
+            if snapshot is None:
+                raise ValueError("Missing floor replay return state")
+            self.floor_number = snapshot["floor"]
+            self.floor_wave = snapshot["floor_wave"]
+            self.wave = snapshot["wave"]
+            self.wave_left = snapshot["wave_left"]
+            self.floor_kills_start = snapshot["floor_kills_start"]
+            self.active_quest_index = snapshot["quest_index"] or 0
+            self.active_quest = (
+                QUEST_OPTIONS[snapshot["quest_index"]]
+                if snapshot["quest_index"] is not None else None
+            )
+            self.quest_progress = snapshot["quest_progress"]
+            self.quest_complete = snapshot["quest_complete"]
+            self.encounter_clear = snapshot["encounter_clear"]
+            self.minion_difficulty = snapshot["minion_difficulty"]
+            if self.active_quest is not None:
+                self.prepare_quest_options()
+                self.quest_reward = self.quest_rewards[self.active_quest_index]
+            self.replay_active = False
+            self.replay_return_snapshot = None
+            self.boss_corpses.clear()
+            self.boss_chests.clear()
+            self.enemies.clear()
+            self.pickups.clear()
+            self.projectiles.clear()
+            self.effects.clear()
+            self.state = "floor_progression"
+            self.message = "FLOOR REPLAY COMPLETE  -  ORIGINAL PROGRESS PRESERVED"
+            self.message_until = time.monotonic() + 3
+            self.save_game()
+            return
         if self.stage_number() >= MAX_FLOORS:
             self.state = "victory"
             self.message = "THE 200TH FLOOR IS YOURS. THE TOWER IS CONQUERED."
@@ -1289,6 +1574,52 @@ class BattlefieldRPG:
         }
         self.save_game()
 
+    def replay_cleared_floor(self, floor):
+        record = self.floor_record(floor)
+        if record is None or self.replay_active:
+            return
+        quest_index = record.get("quest_index", 0)
+        if not isinstance(quest_index, int) or not 0 <= quest_index < len(QUEST_OPTIONS):
+            quest_index = 0
+        self.replay_return_snapshot = {
+            "floor": self.stage_number(),
+            "floor_wave": self.floor_wave,
+            "wave": self.wave,
+            "wave_left": self.wave_left,
+            "floor_kills_start": self.floor_kills_start,
+            "quest_index": (
+                self.active_quest_index if self.active_quest is not None else None
+            ),
+            "quest_progress": self.quest_progress,
+            "quest_complete": self.quest_complete,
+            "encounter_clear": self.encounter_clear,
+            "minion_difficulty": self.minion_difficulty,
+        }
+        self.replay_active = True
+        self.floor_number = floor
+        self.floor_wave = 1
+        self.wave = max(1, (floor - 1) * 10 + 1)
+        self.wave_left = 0
+        self.floor_kills_start = self.kills
+        self.active_quest = None
+        self.active_quest_index = quest_index
+        self.quest_progress = 0
+        self.quest_complete = False
+        self.encounter_clear = False
+        self.minion_difficulty = None
+        self.special_shots_left = SPECIAL_SHOTS_PER_FLOOR
+        self.enemies.clear()
+        self.pickups.clear()
+        self.projectiles.clear()
+        self.effects.clear()
+        self.boss_corpses.clear()
+        self.boss_chests.clear()
+        self.prepare_quest_options()
+        self.state = "quest_select"
+        self.message = f"REPLAYING FLOOR {floor}  -  CHOOSE A QUEST"
+        self.message_until = time.monotonic() + 3
+        self.save_game()
+
     def advance_progression_page(self, delta):
         self.progression_page = max(
             0, min((MAX_FLOORS - 1) // 12, self.progression_page + delta)
@@ -1308,14 +1639,61 @@ class BattlefieldRPG:
         self.market_search = ""
         self.state = "marketplace"
 
+    def handle_skill_forge_click(self, x, y):
+        if 90 <= y <= 118:
+            if 50 <= x <= 450 and self.forge_selected_skills:
+                self.forge_selected_skills.pop(0)
+            elif 510 <= x <= 910 and len(self.forge_selected_skills) > 1:
+                self.forge_selected_skills.pop(1)
+            return
+        if 130 <= y < 500 and 52 <= x <= 908:
+            row = (y - 130) // 44
+            visible = self.visible_skill_copies()
+            index = self.forge_page * 8 + row
+            if 0 <= index < len(visible) and len(self.forge_selected_skills) < 2:
+                skill, count = visible[index]
+                selected_count = self.forge_selected_skills.count(skill[0])
+                if selected_count >= count:
+                    self.message = f"ONLY {count} {skill[0].upper()} COPY/COPIES AVAILABLE"
+                    self.message_until = time.monotonic() + 2
+                else:
+                    self.forge_selected_skills.append(skill[0])
+            return
+        if y >= 550:
+            if x <= 220:
+                self.state = "marketplace"
+            elif 245 <= x <= 375:
+                self.forge_page = max(0, self.forge_page - 1)
+            elif 385 <= x <= 575:
+                self.craft_selected_skills()
+            elif 600 <= x <= 730:
+                pages = max(1, (len(self.visible_skill_copies()) + 7) // 8)
+                self.forge_page = min(pages - 1, self.forge_page + 1)
+            elif x >= 750:
+                self.forge_selected_skills = []
+
     def open_special_loadout(self, return_state):
         self.special_loadout_return_state = return_state
         self.special_loadout_page = 0
+        self.special_loadout_tab = "weapons"
         self.state = "special_loadout"
 
     def handle_special_loadout_click(self, x, y):
+        if 90 <= y <= 120:
+            if 180 <= x <= 460:
+                self.special_loadout_tab = "weapons"
+                return
+            if 500 <= x <= 780:
+                self.special_loadout_tab = "skills"
+                return
         if y >= 555 and x <= 260:
             self.state = self.special_loadout_return_state
+            return
+        if self.special_loadout_tab == "skills":
+            if 125 <= y < 545 and 52 <= x <= 910:
+                row = (y - 125) // 54
+                if 0 <= row < len(self.unlocked_abilities):
+                    self.toggle_equipped_skill(self.unlocked_abilities[row])
             return
         if y >= 555 and x >= 690:
             self.special_loadout_page += 1
@@ -1334,6 +1712,31 @@ class BattlefieldRPG:
                 self.message = f'{weapon["name"].upper()} EQUIPPED'
                 self.message_until = time.monotonic() + 2
                 self.save_game()
+
+    def toggle_equipped_skill(self, skill):
+        if skill not in self.unlocked_abilities:
+            return
+        active_skill = (
+            self.equipped_abilities[self.active_ability]
+            if 0 <= self.active_ability < len(self.equipped_abilities) else None
+        )
+        if skill in self.equipped_abilities:
+            self.equipped_abilities.remove(skill)
+            self.message = f"{skill[0].upper()} UNEQUIPPED"
+        elif len(self.equipped_abilities) >= MAX_ABILITIES:
+            self.message = f"ONLY {MAX_ABILITIES} SKILLS CAN BE EQUIPPED  -  UNEQUIP ONE FIRST"
+            self.message_until = time.monotonic() + 2.5
+            return
+        else:
+            self.equipped_abilities.append(skill)
+            self.message = f"{skill[0].upper()} EQUIPPED"
+        self.has_boss_ability = bool(self.equipped_abilities)
+        if active_skill in self.equipped_abilities:
+            self.active_ability = self.equipped_abilities.index(active_skill)
+        else:
+            self.active_ability = 0
+        self.message_until = time.monotonic() + 2
+        self.save_game()
 
     def handle_progression_click(self, x, y):
         if y < 112 and 300 <= x <= 430:
@@ -1359,6 +1762,8 @@ class BattlefieldRPG:
                 if (self.progression_return_state == "post_boss"
                         and self.progression_selected_floor == self.stage_number()):
                     self.continue_stage()
+                elif self.floor_record(self.progression_selected_floor):
+                    self.replay_cleared_floor(self.progression_selected_floor)
 
     def visible_market_weapons(self):
         weapons = [
@@ -1376,6 +1781,9 @@ class BattlefieldRPG:
         return weapons
 
     def handle_market_click(self, x, y):
+        if 760 <= x <= 915 and 50 <= y <= 100:
+            self.open_skill_forge()
+            return
         if y >= 570 and x <= 180:
             self.state = "floor_progression"
             return
@@ -1634,23 +2042,23 @@ class BattlefieldRPG:
             return
 
         skill = self.pending_skill
-        replaced_skill = None
-        if (skill not in self.unlocked_abilities
-                and len(self.unlocked_abilities) >= MAX_ABILITIES):
-            replaced_skill = self.unlocked_abilities.pop(0)
-            self.ability_cooldowns.pop(replaced_skill[0], None)
+        was_known = skill in self.unlocked_abilities
         if skill not in self.unlocked_abilities:
             self.unlocked_abilities.append(skill)
-        self.has_boss_ability = True
-        self.active_ability = self.unlocked_abilities.index(skill)
+        self.skill_copies.append(skill)
+        if skill not in self.equipped_abilities and len(self.equipped_abilities) < MAX_ABILITIES:
+            self.equipped_abilities.append(skill)
+        self.has_boss_ability = bool(self.equipped_abilities)
+        if skill in self.equipped_abilities:
+            self.active_ability = self.equipped_abilities.index(skill)
         self.ability_cooldowns.setdefault(skill[0], 0)
         self.pending_skill = None
         self.skill_acquire_progress = 0
         self.state = "post_boss"
         self.travel_ready_at = now
         self.message = (
-            f"{replaced_skill[0]} REPLACED BY {skill[0]}"
-            if replaced_skill else f"SKILL ACQUIRED  -  {skill[0]}"
+            f"{'DUPLICATE SKILL COPY ACQUIRED' if was_known else 'SKILL ACQUIRED'}"
+            f"  -  {skill[0]}  |  MANAGE SKILLS IN SPECIAL WEAPONS"
         )
         self.message_until = now + 2.5
         self.save_game()
@@ -1695,7 +2103,7 @@ class BattlefieldRPG:
                 continue
             ex, ey = p["x"] - enemy["x"], p["y"] - enemy["y"]
             distance = max(1, math.hypot(ex, ey))
-            if distance > enemy["radius"] + 20:
+            if distance > enemy["radius"] + self.player_radius() + 5:
                 speed = enemy["speed"] * (0.45 if now < enemy.get("slowed_until", 0) else 1)
                 enemy["x"] += ex / distance * speed * dt
                 enemy["y"] += ey / distance * speed * dt
@@ -1851,6 +2259,10 @@ class BattlefieldRPG:
     def update_boss(self, boss, now):
         if now >= boss["special_ready"] and boss["special_until"] <= 0:
             p = self.player
+            skills = boss.get("skills") or [boss["skill"]]
+            skill_index = boss.get("next_skill_index", 0) % len(skills)
+            boss["skill"] = skills[skill_index]
+            boss["next_skill_index"] = (skill_index + 1) % len(skills)
             skill_name = boss["skill"][0]
             boss["special_ready"] = now + 5.5
             if skill_name == "Time Freeze":
@@ -2099,16 +2511,16 @@ class BattlefieldRPG:
     def use_boss_ability(self, now, ability_index=None,
                          target_x=None, target_y=None):
         p = self.player
-        if not self.has_boss_ability:
+        if not self.equipped_abilities:
             self.message = 'SCOUT: "I need to defeat a warlord to learn their technique."'
             self.message_until = now + 1.8
             return
         if ability_index is None:
             ability_index = self.active_ability
-        if not 0 <= ability_index < len(self.unlocked_abilities):
+        if not 0 <= ability_index < len(self.equipped_abilities):
             return
         self.active_ability = ability_index
-        skill = self.unlocked_abilities[ability_index]
+        skill = self.equipped_abilities[ability_index]
         skill_name = skill[0]
         ready_at = self.ability_cooldowns.get(skill_name, 0)
         if now < ready_at:
@@ -2130,7 +2542,20 @@ class BattlefieldRPG:
         self.audio.speak(skill[1])
         power = 1 + self.skill_upgrade * 0.45
         area = 1 + self.skill_upgrade * 0.16
-        if skill[0] == "Groundsplit":
+        if skill_name in self.crafted_skill_data:
+            damage, skill_range = self.skill_damage_range(skill)
+            radius = skill_range * area
+            self.effects.append({
+                "kind": "frost", "x": p["x"], "y": p["y"],
+                "radius": radius, "until": now + 0.65,
+            })
+            for enemy in self.enemies[:]:
+                if math.hypot(enemy["x"] - p["x"], enemy["y"] - p["y"]) <= radius:
+                    enemy["hp"] -= int(damage * power)
+                    enemy["hurt_until"] = now + 0.2
+                    if enemy["hp"] <= 0:
+                        self.defeat_enemy(enemy, now)
+        elif skill[0] == "Groundsplit":
             fx, fy = p["face"]
             end_x, end_y = p["x"] + fx * 320 * area, p["y"] + fy * 320 * area
             self.effects.append({"kind": "player_fissure",
@@ -2252,7 +2677,9 @@ class BattlefieldRPG:
                         self.defeat_enemy(enemy, now)
         elif math.hypot(
                 self.player["x"] - effect["x"],
-                self.player["y"] - effect["y"]) <= effect["radius"] + 15:
+                self.player["y"] - effect["y"]) <= (
+                    effect["radius"] + self.player_radius()
+                ):
             if now >= self.player["shield_until"]:
                 self.player["hp"] = max(
                     0, self.player["hp"] - effect["damage"]
@@ -2717,17 +3144,33 @@ class BattlefieldRPG:
         next_allowed = (
             self.progression_return_state == "post_boss"
             and selected == self.stage_number()
+            and not self.replay_active
         )
+        replay_finish_allowed = (
+            self.replay_active
+            and self.progression_return_state == "post_boss"
+            and selected == self.stage_number()
+            and self.encounter_clear
+        )
+        replay_allowed = record is not None and not self.replay_active
+        action_enabled = next_allowed or replay_finish_allowed or replay_allowed
         c.create_rectangle(655, 555, 920, 598,
-                           fill="#53634d" if next_allowed else "#202624",
+                           fill="#53634d" if action_enabled else "#202624",
                            outline="#d4bd91", tags="frame")
-        action = ("NEXT FLOOR / BOSS" if next_allowed else
-                  "REVIEW CLEARED FLOORS")
+        action = (
+            "NEXT FLOOR / BOSS" if next_allowed
+            else (
+                "RETURN AFTER REPLAY" if replay_finish_allowed
+                else ("REPLAY IN PROGRESS" if self.replay_active
+                      else ("PLAY THIS FLOOR AGAIN" if replay_allowed
+                            else "SELECT A CLEARED FLOOR"))
+            )
+        )
         c.create_text(787, 576, text=action,
-                      fill="#fff1d2" if next_allowed else "#7a817b",
+                      fill="#fff1d2" if action_enabled else "#7a817b",
                       font=("Segoe UI", 9, "bold"), tags="frame")
         c.create_text(WIDTH / 2, 625,
-                      text="SELECT A CLEARED FLOOR TO REVIEW ITS QUEST AND STAR RATING",
+                      text="REPLAY CLEARED FLOORS TO CHOOSE A QUEST AND FIGHT THROUGH THEM AGAIN",
                       fill="#aeb6aa", font=("Segoe UI", 9, "bold"), tags="frame")
 
     def draw_marketplace(self):
@@ -2738,6 +3181,11 @@ class BattlefieldRPG:
         c.create_text(WIDTH / 2, 76,
                       text=f"COINS {self.coins:,}  |  1,000 GENERATED WEAPONS  |  SEARCH: {self.market_search or '—'}",
                       fill="#e5c874", font=("Segoe UI", 10, "bold"), tags="frame")
+        c.create_rectangle(760, 50, 915, 100, fill="#53634d",
+                           outline="#d4bd91", tags="frame")
+        c.create_text(837, 75, text="SKILL FORGE",
+                      fill="#fff1d2", font=("Segoe UI", 10, "bold"),
+                      tags="frame")
         visible = self.visible_market_weapons()
         pages = max(1, (len(visible) + 9) // 10)
         self.market_page = min(self.market_page, pages - 1)
@@ -2768,6 +3216,64 @@ class BattlefieldRPG:
         c.create_text(WIDTH / 2, 626,
                       text="LASER: PIERCING BEAM  |  ROCKET: AREA BLAST  |  ATOMIC: HALF-MAP BLAST  |  3 SHOTS PER FLOOR",
                       fill="#c2c7b9", font=("Segoe UI", 8, "bold"), tags="frame")
+
+    def draw_skill_forge(self):
+        c = self.canvas
+        c.create_rectangle(0, 0, WIDTH, HEIGHT, fill="#101718", tags="frame")
+        c.create_text(WIDTH / 2, 35, text="BOSS SKILL FORGE",
+                      fill="#f0d7c5", font=("Segoe UI", 25, "bold"), tags="frame")
+        c.create_text(
+            WIDTH / 2, 68,
+            text="Choose two skill copies. Both are consumed; damage and range are added.",
+            fill="#e5c874", font=("Segoe UI", 10, "bold"), tags="frame"
+        )
+        selected = self.forge_selected_skills
+        for index, (x1, x2) in enumerate(((50, 450), (510, 910))):
+            name = selected[index] if index < len(selected) else "CLICK TO CLEAR / SELECT AN INGREDIENT"
+            c.create_rectangle(x1, 90, x2, 118, fill="#35443d",
+                               outline="#d4bd91", tags="frame")
+            c.create_text((x1 + x2) / 2, 104, text=name,
+                          fill="#fff1d2", font=("Segoe UI", 9, "bold"),
+                          tags="frame")
+        visible = self.visible_skill_copies()
+        pages = max(1, (len(visible) + 7) // 8)
+        self.forge_page = min(self.forge_page, pages - 1)
+        page_skills = visible[self.forge_page * 8:self.forge_page * 8 + 8]
+        for row, (skill, count) in enumerate(page_skills):
+            y = 130 + row * 44
+            selected_count = selected.count(skill[0])
+            c.create_rectangle(52, y, 908, y + 38, fill="#29332f",
+                               outline="#e5c874" if selected_count else "#69766b",
+                               width=2 if selected_count else 1, tags="frame")
+            damage, skill_range = self.skill_damage_range(skill)
+            c.create_text(
+                72, y + 19, anchor="w",
+                text=f"{skill[0]}  x{count}  |  {damage} DAMAGE  /  {skill_range} RANGE",
+                fill="#f0d7c5", font=("Segoe UI", 9, "bold"), tags="frame"
+            )
+            c.create_text(
+                885, y + 19, anchor="e",
+                text=f"SELECTED {selected_count}" if selected_count else "CLICK TO SELECT",
+                fill="#e5c874", font=("Segoe UI", 8, "bold"), tags="frame"
+            )
+        controls = (
+            (40, 220, "BACK TO MARKET"),
+            (245, 375, "◀ PREVIOUS"),
+            (385, 575, "FORGE SKILL"),
+            (600, 730, "NEXT ▶"),
+            (750, 920, "CLEAR CHOICES"),
+        )
+        for x1, x2, label in controls:
+            c.create_rectangle(x1, 550, x2, 598, fill="#35443d",
+                               outline="#d4bd91", tags="frame")
+            c.create_text((x1 + x2) / 2, 574, text=label,
+                          fill="#fff1d2", font=("Segoe UI", 8, "bold"),
+                          tags="frame")
+        c.create_text(
+            WIDTH / 2, 625,
+            text=f"COPIES HELD: {len(self.skill_copies)}  |  PAGE {self.forge_page + 1}/{pages}  |  NO COIN COST",
+            fill="#c2c7b9", font=("Segoe UI", 9, "bold"), tags="frame"
+        )
 
     def draw_boss_corpse(self, corpse):
         x, y = corpse["x"], corpse["y"]
@@ -2947,12 +3453,17 @@ class BattlefieldRPG:
             self.canvas.create_text(874, 74, text=auto_aim_label,
                                     fill="#fff1d2", font=("Segoe UI", 8, "bold"),
                                     tags="frame")
+        region_status = f"REGION  {REGIONS[self.region][0]}"
+        if self.evolved:
+            region_status = f"ASCENDED  -  LEVEL 100  |  {region_status}"
+        elif self.has_all_boss_skills():
+            region_status += "  |  EVOLUTION READY  -  PRESS T"
         self.canvas.create_text(WIDTH / 2, 68,
-                                text=f"REGION  {REGIONS[self.region][0]}",
+                                text=region_status,
                                 fill="#d0d4c2", font=("Segoe UI", 8, "bold"), tags="frame")
-        if self.unlocked_abilities:
+        if self.equipped_abilities:
             skill_labels = []
-            for index, skill in enumerate(self.unlocked_abilities):
+            for index, skill in enumerate(self.equipped_abilities):
                 ready_at = self.ability_cooldowns.get(skill[0], 0)
                 state = "READY" if now >= ready_at else f"{ready_at - now:.1f}s"
                 skill_labels.append(f"{index + 1} {skill[0]} {state}")
@@ -3089,19 +3600,31 @@ class BattlefieldRPG:
             for effect in self.effects
         )
         facing = p["face"]
+        player_radius = self.player_radius()
         if not player_becomes_titan:
             if now < p["knockdown_until"]:
                 self.draw_knockdown(p["x"], p["y"])
             else:
+                if self.evolved:
+                    self.canvas.create_oval(
+                        p["x"] - player_radius - 5,
+                        p["y"] - player_radius - 5,
+                        p["x"] + player_radius + 5,
+                        p["y"] + player_radius + 5,
+                        outline="#e5c874", width=2, tags="frame"
+                    )
                 self.draw_entity(
-                    p["x"], p["y"], 15, "#72a2ad", "#d5d9c0", facing, "scout",
+                    p["x"], p["y"], player_radius, "#72a2ad", "#d5d9c0",
+                    facing, "scout",
                     moving=any(key in self.keys for key in
                                ("w", "a", "s", "d", "up", "down", "left", "right"))
                 )
             if now < p["frozen_until"]:
                 self.canvas.create_oval(
-                    p["x"] - 23, p["y"] - 25,
-                    p["x"] + 23, p["y"] + 25,
+                    p["x"] - player_radius - 8,
+                    p["y"] - player_radius - 10,
+                    p["x"] + player_radius + 8,
+                    p["y"] + player_radius + 10,
                     outline="#a9efff", width=3, tags="frame"
                 )
                 self.canvas.create_text(
@@ -3347,8 +3870,8 @@ class BattlefieldRPG:
         self.canvas.create_text(WIDTH / 2, 463,
                                 text=f"Boss skill acquired: {self.boss_skill()[0]}. Cast skills directly with keys 1-5.",
                                 fill="#9fe0ce", font=("Segoe UI", 12, "bold"), tags="frame")
-        if len(self.unlocked_abilities) > 1:
-            skills = ", ".join(skill[0] for skill in self.unlocked_abilities)
+        if len(self.equipped_abilities) > 1:
+            skills = ", ".join(skill[0] for skill in self.equipped_abilities)
             self.canvas.create_text(WIDTH / 2, 480,
                                     text=f"Unlocked skills: {skills}",
                                     fill="#c2c7b9", font=("Segoe UI", 9), tags="frame")
@@ -4096,64 +4619,138 @@ class BattlefieldRPG:
     def draw_special_loadout(self):
         c = self.canvas
         c.create_rectangle(0, 0, WIDTH, HEIGHT, fill="#101718", tags="frame")
-        c.create_text(WIDTH / 2, 40, text="SPECIAL WEAPONS",
+        c.create_text(WIDTH / 2, 40, text="SPECIAL LOADOUT",
                       fill="#f0d7c5", font=("Segoe UI", 25, "bold"), tags="frame")
-        equipped = (
-            MARKET_WEAPONS[self.equipped_special_weapon]
-            if self.equipped_special_weapon is not None else None
-        )
-        equipped_label = (
-            f'EQUIPPED: {equipped["name"]} [{equipped["type"]}]'
-            if equipped else "EQUIPPED: NONE"
-        )
-        c.create_text(WIDTH / 2, 78,
-                      text=f"{equipped_label}  |  {len(self.owned_special_weapons)} OWNED",
-                      fill="#8ee5f0", font=("Segoe UI", 11, "bold"), tags="frame")
+        for x1, x2, tab, label in (
+                (180, 460, "weapons", "SPECIAL WEAPONS"),
+                (500, 780, "skills", "BOSS SKILLS")):
+            selected = self.special_loadout_tab == tab
+            c.create_rectangle(
+                x1, 90, x2, 120,
+                fill="#74563d" if selected else "#35443d",
+                outline="#d4bd91", width=1, tags="frame"
+            )
+            c.create_text((x1 + x2) / 2, 105, text=label,
+                          fill="#fff1d2", font=("Segoe UI", 9, "bold"),
+                          tags="frame")
 
-        per_page = 10
-        pages = max(1, (len(self.owned_special_weapons) + per_page - 1) // per_page)
-        self.special_loadout_page = min(self.special_loadout_page, pages - 1)
-        start = self.special_loadout_page * per_page
-        visible = self.owned_special_weapons[start:start + per_page]
-        if not visible:
-            c.create_text(WIDTH / 2, 280,
-                          text="NO SPECIAL WEAPONS OWNED YET",
-                          fill="#c2c7b9", font=("Segoe UI", 16, "bold"), tags="frame")
-            c.create_text(WIDTH / 2, 320,
-                          text="Unlock a market stand from the floor progression screen to buy some.",
-                          fill="#929c93", font=("Segoe UI", 10), tags="frame")
-        for row, weapon_id in enumerate(visible):
-            weapon = MARKET_WEAPONS[weapon_id]
-            y = 125 + row * 42
-            is_equipped = weapon_id == self.equipped_special_weapon
-            c.create_rectangle(52, y, 908, y + 36,
-                               fill="#46523e" if is_equipped else "#29332f",
-                               outline="#e5c874" if is_equipped else "#69766b",
-                               width=2 if is_equipped else 1, tags="frame")
+        pages = 1
+        if self.special_loadout_tab == "skills":
             c.create_text(
-                72, y + 18, anchor="w",
-                text=f'{weapon["id"] + 1:04d}  {weapon["name"]}  [{weapon["type"]}]',
-                fill="#f0d7c5", font=("Segoe UI", 10, "bold"), tags="frame"
+                WIDTH / 2, 78,
+                text=f"EQUIP UP TO {MAX_ABILITIES}  |  "
+                     f"{len(self.equipped_abilities)}/{MAX_ABILITIES} EQUIPPED  |  "
+                     f"{len(self.skill_copies)} SKILL COPIES",
+                fill="#e5c874", font=("Segoe UI", 10, "bold"), tags="frame"
+            )
+            if not self.unlocked_abilities:
+                c.create_text(WIDTH / 2, 280,
+                              text="NO BOSS SKILLS LEARNED YET",
+                              fill="#c2c7b9", font=("Segoe UI", 16, "bold"),
+                              tags="frame")
+            for row, skill in enumerate(self.unlocked_abilities):
+                y = 128 + row * 54
+                is_equipped = skill in self.equipped_abilities
+                c.create_rectangle(
+                    52, y, 908, y + 46,
+                    fill="#46523e" if is_equipped else "#29332f",
+                    outline="#e5c874" if is_equipped else "#69766b",
+                    width=2 if is_equipped else 1, tags="frame"
+                )
+                c.create_text(
+                    72, y + 15, anchor="w", text=skill[0],
+                    fill="#f0d7c5", font=("Segoe UI", 10, "bold"),
+                    tags="frame"
+                )
+                c.create_text(
+                    72, y + 33, anchor="w", text=skill[2],
+                    fill="#c2c7b9", font=("Segoe UI", 8), tags="frame"
+                )
+                c.create_text(
+                    885, y + 23, anchor="e",
+                    text=(
+                        f"COPIES {sum(copy[0] == skill[0] for copy in self.skill_copies)}"
+                        f"  |  {'EQUIPPED' if is_equipped else 'CLICK TO EQUIP'}"
+                    ),
+                    fill="#e5c874", font=("Segoe UI", 9, "bold"), tags="frame"
+                )
+            controls = (
+                (40, 230, "BACK"),
+                (365, 620, "SELECT UP TO FIVE SKILLS"),
+                (700, 920, ""),
+            )
+            c.create_text(WIDTH / 2, 630,
+                          text="EQUIPPED SKILLS USE HOTKEYS 1-5 IN THE ORDER SHOWN",
+                          fill="#aeb6aa", font=("Segoe UI", 9, "bold"),
+                          tags="frame")
+        else:
+            equipped = (
+                MARKET_WEAPONS[self.equipped_special_weapon]
+                if self.equipped_special_weapon is not None else None
+            )
+            equipped_label = (
+                f'EQUIPPED: {equipped["name"]} [{equipped["type"]}]'
+                if equipped else "EQUIPPED: NONE"
             )
             c.create_text(
-                885, y + 18, anchor="e",
-                text="EQUIPPED" if is_equipped else "CLICK TO EQUIP",
-                fill="#e5c874", font=("Segoe UI", 9, "bold"), tags="frame"
+                WIDTH / 2, 78,
+                text=f"{equipped_label}  |  {len(self.owned_special_weapons)} OWNED",
+                fill="#8ee5f0", font=("Segoe UI", 11, "bold"), tags="frame"
             )
-
-        controls = (
-            (40, 230, "BACK"),
-            (365, 620, f"PAGE {self.special_loadout_page + 1}/{pages}  -  PREVIOUS"),
-            (700, 920, "NEXT PAGE"),
-        )
+            per_page = 10
+            pages = max(
+                1, (len(self.owned_special_weapons) + per_page - 1) // per_page
+            )
+            self.special_loadout_page = min(self.special_loadout_page, pages - 1)
+            start = self.special_loadout_page * per_page
+            visible = self.owned_special_weapons[start:start + per_page]
+            if not visible:
+                c.create_text(WIDTH / 2, 280,
+                              text="NO SPECIAL WEAPONS OWNED YET",
+                              fill="#c2c7b9", font=("Segoe UI", 16, "bold"),
+                              tags="frame")
+                c.create_text(
+                    WIDTH / 2, 320,
+                    text="Unlock a market stand from the floor progression screen to buy some.",
+                    fill="#929c93", font=("Segoe UI", 10), tags="frame"
+                )
+            for row, weapon_id in enumerate(visible):
+                weapon = MARKET_WEAPONS[weapon_id]
+                y = 125 + row * 42
+                is_equipped = weapon_id == self.equipped_special_weapon
+                c.create_rectangle(
+                    52, y, 908, y + 36,
+                    fill="#46523e" if is_equipped else "#29332f",
+                    outline="#e5c874" if is_equipped else "#69766b",
+                    width=2 if is_equipped else 1, tags="frame"
+                )
+                c.create_text(
+                    72, y + 18, anchor="w",
+                    text=f'{weapon["id"] + 1:04d}  {weapon["name"]}  [{weapon["type"]}]',
+                    fill="#f0d7c5", font=("Segoe UI", 10, "bold"), tags="frame"
+                )
+                c.create_text(
+                    885, y + 18, anchor="e",
+                    text="EQUIPPED" if is_equipped else "CLICK TO EQUIP",
+                    fill="#e5c874", font=("Segoe UI", 9, "bold"), tags="frame"
+                )
+            controls = (
+                (40, 230, "BACK"),
+                (365, 620, f"PAGE {self.special_loadout_page + 1}/{pages}  -  PREVIOUS"),
+                (700, 920, "NEXT PAGE"),
+            )
+            c.create_text(
+                WIDTH / 2, 630,
+                text="SPECIAL WEAPONS ARE SEPARATE FROM NORMAL CHARACTER GUN COSMETICS",
+                fill="#aeb6aa", font=("Segoe UI", 9, "bold"), tags="frame"
+            )
         for x1, x2, label in controls:
+            if not label:
+                continue
             c.create_rectangle(x1, 565, x2, 605, fill="#35443d",
                                outline="#d4bd91", tags="frame")
             c.create_text((x1 + x2) / 2, 585, text=label,
                           fill="#fff1d2", font=("Segoe UI", 9, "bold"), tags="frame")
-        c.create_text(WIDTH / 2, 630,
-                      text="SPECIAL WEAPONS ARE SEPARATE FROM NORMAL CHARACTER GUN COSMETICS",
-                      fill="#aeb6aa", font=("Segoe UI", 9, "bold"), tags="frame")
         if time.monotonic() < self.message_until:
             c.create_text(WIDTH / 2, 530, text=self.message,
                           fill="#e5c874", font=("Segoe UI", 10, "bold"), tags="frame")
@@ -4168,7 +4765,8 @@ class BattlefieldRPG:
                                 fill="#c2c7b9", font=("Segoe UI", 12), tags="frame")
         for y1, y2, label in ((320, 370, "RESUME  -  ESC"),
                               (390, 440, "CHANGE CHARACTER  -  C"),
-                              (460, 510, "FLOOR PROGRESSION  -  P")):
+                              (460, 510, "FLOOR PROGRESSION  -  P"),
+                              (530, 580, "RESTART FLOOR")):
             self.canvas.create_rectangle(370, y1, 590, y2, fill="#53634d",
                                          outline="#d4bd91", width=1, tags="frame")
             self.canvas.create_text(WIDTH / 2, (y1 + y2) / 2, text=label,
@@ -4307,7 +4905,7 @@ class BattlefieldRPG:
         )
         self.canvas.create_text(
             WIDTH / 2, 510,
-            text="CTRL+SHIFT+S SAVE NOW  |  GAME ALSO SAVES WHEN YOU CLOSE",
+            text="AUTO-SAVES EVERY 10 SECONDS  |  CTRL+SHIFT+S SAVES NOW",
             fill="#9ea99d", font=("Segoe UI", 9, "bold"), tags="frame"
         )
         if time.monotonic() < self.save_notice_until:
@@ -4325,6 +4923,7 @@ class BattlefieldRPG:
             self.update_tower_gate(dt)
         if self.state in ("playing", "boss_skill", "post_boss"):
             self.update(dt, now)
+        self.autosave_if_due(now)
         if self.state in ("playing", "paused", "gameover", "region_map",
                           "boss_cutscene", "boss_dialogue", "boss_skill",
                           "minion_reveal", "kidnapper_reveal", "post_boss",
@@ -4367,6 +4966,8 @@ class BattlefieldRPG:
             self.draw_floor_progression()
         elif self.state == "marketplace":
             self.draw_marketplace()
+        elif self.state == "skill_forge":
+            self.draw_skill_forge()
         elif self.state == "special_loadout":
             self.draw_special_loadout()
         elif self.state == "paused":
