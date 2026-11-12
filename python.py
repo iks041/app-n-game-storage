@@ -20,15 +20,17 @@ if sys.platform == "win32":
 
 WIDTH = 960
 HEIGHT = 640
-MAX_FLOORS = 200
+MAX_FLOORS = 150
+MINION_BOSS_FLOORS = (5, 10, 15, 20, 25)
 ARENA = (24, 92, WIDTH - 24, HEIGHT - 48)
+TERRAIN_TILE_SIZE = 64
 REGIONS = [
-    ("ASHEN FRONT", "#45544a", "#b7955f", "#60725c"),
-    ("FROSTLINE PASS", "#496777", "#b2d8e6", "#617d89"),
-    ("REDSTONE WASTES", "#704b3c", "#dd9b62", "#8e6245"),
-    ("IRONWOOD", "#3f6749", "#9bb96d", "#577752"),
+    ("ASHEN FRONT", "#252632", "#71627e", "#353443"),
+    ("FROSTLINE PASS", "#26343d", "#7098a8", "#354751"),
+    ("REDSTONE WASTES", "#382a35", "#a76573", "#503640"),
+    ("IRONWOOD", "#202e2c", "#678c7e", "#304540"),
 ]
-REGION_ACCENTS = ("#f1b85a", "#8ee5f0", "#ff8c54", "#a5d46d")
+REGION_ACCENTS = ("#ce78ef", "#8ee5f0", "#ff817f", "#8ed2a4")
 ROMAN_NUMERALS = ("I", "II", "III", "IV", "V", "VI", "VII", "VIII")
 QUEST_OPTIONS = (
     ("CLEAR THE HALL", "Defeat 6 enemies", 6),
@@ -42,6 +44,16 @@ TOWER_MINIONS = (
     ("Nhalia, the Ash Seer", "Five seals bind the Demon King. Each of us carried one clue."),
     ("Drazhul, the Gate Eater", "The last seal opens a shortcut. Seek the throne passage, not the long stairs."),
     ("Mordane, the Hollow Fang", "The one who took him is his own shadow, wearing a stolen shape."),
+)
+MYTHIC_BEASTS = (
+    ("Fenrir", "wolf", "SHADOW POUNCE", "#78536f"),
+    ("Asterion", "griffin", "SKYFALL DIVE", "#9d704c"),
+    ("Hydra", "hydra", "VENOM BURST", "#547c69"),
+    ("Cerberus", "cerberus", "THREEFOLD FLAME", "#873f48"),
+    ("Chimera", "chimera", "MANTICORE SPIKES", "#8a683e"),
+)
+DEMON_ENEMY_KINDS = (
+    "winged_demon", "horned_demon", "gravity_mage", "staff_demon",
 )
 BOSS_SKILLS = (
     ("Groundsplit", 'Earth, answer me! Groundsplit!',
@@ -293,14 +305,16 @@ class BattlefieldRPG:
     def __init__(self, root):
         self.root = root
         self.root.title("Ashen Front")
-        self.root.resizable(False, False)
+        self.root.resizable(True, True)
         self.canvas = tk.Canvas(
             root, width=WIDTH, height=HEIGHT, bg="#171d20", highlightthickness=0
         )
-        self.canvas.pack()
+        self.canvas.pack(fill=tk.BOTH, expand=True)
         self.canvas.bind("<Button-1>", self.on_click)
         self.canvas.bind("<Button-3>", self.on_right_click)
+        self.canvas.bind("<MouseWheel>", self.on_mousewheel)
         self.canvas.bind("<Motion>", self.on_mouse_move)
+        self.canvas.bind("<Configure>", self.on_canvas_resize)
         self.root.bind("<KeyPress>", self.on_key_down)
         self.root.bind("<KeyRelease>", self.on_key_up)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
@@ -311,7 +325,10 @@ class BattlefieldRPG:
         self.save_notice_until = 0
 
         self.keys = set()
-        self.decor = self.make_decor()
+        self.view_scale_x = 1.0
+        self.view_scale_y = 1.0
+        self.battlefield_zoom = 1.0
+        self.fullscreen = False
         mote_rng = random.Random(731)
         self.ambient_motes = [
             (
@@ -341,18 +358,68 @@ class BattlefieldRPG:
         self.draw_background()
         self.tick()
 
-    def make_decor(self):
-        rng = random.Random(17)
-        items = []
-        for _ in range(52):
-            x = rng.randint(ARENA[0] + 14, ARENA[2] - 14)
-            y = rng.randint(ARENA[1] + 14, ARENA[3] - 14)
-            kind = rng.choice(("stone", "grass", "crater"))
-            size = rng.randint(3, 10) if kind != "crater" else rng.randint(12, 24)
-            items.append((x, y, kind, size))
-        return items
+    def floor_fight_style(self, floor=None):
+        styles = (
+            ("RAIDER HORDE", "More enemies rush the arena"),
+            ("MARKSMAN HUNT", "Ranged enemies keep their distance"),
+            ("IRONCLAD LINE", "Armored brutes lead the attack"),
+            ("SHADOW DUEL", "Fast, hard-hitting raiders close in"),
+        )
+        floor = self.stage_number() if floor is None else floor
+        return styles[(floor - 1) % len(styles)]
+
+    def on_canvas_resize(self, event):
+        if event.width <= 1 or event.height <= 1:
+            return
+        scale_x = event.width / (WIDTH * self.view_scale_x)
+        scale_y = event.height / (HEIGHT * self.view_scale_y)
+        if abs(scale_x - 1) < 0.001 and abs(scale_y - 1) < 0.001:
+            return
+        self.canvas.scale("all", 0, 0, scale_x, scale_y)
+        self.view_scale_x *= scale_x
+        self.view_scale_y *= scale_y
+
+    def toggle_fullscreen(self):
+        self.fullscreen = not self.fullscreen
+        self.root.attributes("-fullscreen", self.fullscreen)
+
+    def set_battlefield_zoom(self, zoom):
+        zoom = max(0.65, min(1.55, round(zoom, 2)))
+        if zoom == self.battlefield_zoom:
+            return
+        self.battlefield_zoom = zoom
+        self.refresh_battlefield()
+        self.message = f"BATTLEFIELD ZOOM  {round(zoom * 100)}%"
+        self.message_until = time.monotonic() + 1.2
+
+    def world_coordinates(self, x, y):
+        x /= self.view_scale_x
+        y /= self.view_scale_y
+        return (
+            self.player["x"] + (x - self.player["x"]) / self.battlefield_zoom,
+            self.player["y"] + (y - self.player["y"]) / self.battlefield_zoom,
+        )
+
+    def on_mousewheel(self, event):
+        if self.state not in ("playing", "post_boss"):
+            return
+        direction = 1 if event.delta > 0 else -1
+        self.set_battlefield_zoom(self.battlefield_zoom + direction * 0.1)
+        return "break"
+
+    def game_coordinates(self, x, y):
+        return int(x / self.view_scale_x), int(y / self.view_scale_y)
+
+    def refresh_battlefield(self):
+        self.canvas.delete("background")
+        self.draw_background()
+        self.canvas.tag_lower("background")
 
     def new_game(self):
+        self.battlefield_zoom = 1.0
+        self.camera_x = 0.0
+        self.camera_y = 0.0
+        self.last_frontier_spawn_at = 0.0
         self.player = {
             "x": WIDTH / 2,
             "y": (ARENA[1] + ARENA[3]) / 2,
@@ -373,6 +440,8 @@ class BattlefieldRPG:
             "shield_until": 0,
             "frozen_until": 0,
         }
+        self.mouse_screen_position = (WIDTH / 2 + 100, HEIGHT / 2)
+        self.mouse_position = self.mouse_screen_position
         self.enemies = []
         self.pickups = []
         self.projectiles = []
@@ -413,6 +482,7 @@ class BattlefieldRPG:
         self.forge_page = 0
         self.evolved = False
         self.superhuman_active = False
+        self.superhuman_achieved = False
         self.superhuman_original_stats = None
         self.superhuman_xp_earned = 0
         self.forge_animation_started_at = 0
@@ -475,6 +545,16 @@ class BattlefieldRPG:
         self.tower_clues = []
         self.rescue_route_unlocked = False
         self.rescue_battle = False
+        self.rescue_completed = False
+        self.rescue_failed = False
+        self.shadow_army = []
+        self.shadow_ally = None
+        self.shadow_cooldown_until = 0
+        self.pending_mythic_form = None
+        self.mentor_angel = False
+        self.mentor_text = ""
+        self.mentor_until = 0
+        self.angel_guide_until = 0
         self.demon_ally_next_attack = 0
         self.kidnapper_reveal_until = 0
         self.opening_cutscene_started = 0
@@ -496,18 +576,23 @@ class BattlefieldRPG:
         floor = self.stage_number() if floor is None else floor
         return 3 + ((floor - 1) // 5)
 
+    def is_minion_boss_floor(self, floor=None):
+        floor = self.stage_number() if floor is None else floor
+        return floor in MINION_BOSS_FLOORS and not self.rescue_completed
+
     def is_minion_boss_wave(self):
         return (
             not self.rescue_battle
-            and self.stage_number() >= 15
-            and self.stage_number() % 5 == 0
+            and self.is_minion_boss_floor()
             and self.floor_wave == self.regular_waves_per_floor() + 1
         )
 
     def floor_wave_count(self, floor=None):
         floor = self.stage_number() if floor is None else floor
-        return self.regular_waves_per_floor(floor) + (
-            2 if floor >= 15 and floor % 5 == 0 else 1
+        has_minion_boss = self.is_minion_boss_floor(floor)
+        has_final_boss = floor == MAX_FLOORS
+        return self.regular_waves_per_floor(floor) + int(
+            has_minion_boss or has_final_boss
         )
 
     def begin_floor(self, floor):
@@ -521,6 +606,17 @@ class BattlefieldRPG:
         self.wave_left = 0
         self.wave_pause = 0
         self.minion_difficulty = None
+        self.pending_mythic_form = None
+        self.shadow_ally = None
+        if self.rescue_completed:
+            self.mentor_text = (
+                "ANGEL GUIDE: Watch for gravity magic and the Demon of Death "
+                "and Desire."
+                if floor >= 101 else
+                "ANGEL GUIDE: Grow stronger. Your rescue earned you this path."
+            )
+            self.mentor_until = time.monotonic() + 5
+            self.audio.speak(self.mentor_text)
         self.special_shots_left = SPECIAL_SHOTS_PER_FLOOR
         self.floor_kills_start = self.kills
         self.pending_target_ability = None
@@ -537,6 +633,10 @@ class BattlefieldRPG:
         if self.floor_wave > regular_waves:
             self.wave_left = 1
             if self.is_minion_boss_wave():
+                self.pending_mythic_form = (
+                    MYTHIC_BEASTS[0] if self.stage_number() == 5
+                    else random.choice(MYTHIC_BEASTS)
+                )
                 self.state = "minion_difficulty"
                 self.message = "CHOOSE THE DEMON MINION'S DIFFICULTY"
             else:
@@ -544,13 +644,27 @@ class BattlefieldRPG:
                 self.state = "boss_warning"
                 self.boss_warning_until = time.monotonic() + 3
         else:
-            self.wave_left = 4 + self.stage_number() * 2 + self.floor_wave * 2
+            style_index = (self.stage_number() - 1) % 4
+            style_bonus = 5 if style_index == 0 else (
+                2 if style_index == 1 else 0
+            )
+            self.wave_left = (
+                4 + self.stage_number() * 2 + self.floor_wave * 2 + style_bonus
+            )
+            style_name, style_description = self.floor_fight_style()
             stage = ROMAN_NUMERALS[(self.stage_number() - 1) % len(ROMAN_NUMERALS)]
             self.message = (
                 f"FLOOR {self.stage_number()}  -  WAVE "
-                f"{self.floor_wave}/{self.regular_waves_per_floor()}  -  HOLD THE LINE"
+                f"{self.floor_wave}/{self.regular_waves_per_floor()}  -  "
+                f"{style_name}: {style_description}"
             )
+            if self.state in ("playing", "stage_intro"):
+                self.spawn_initial_enemies()
         self.message_until = time.monotonic() + 2.2
+
+    def spawn_initial_enemies(self):
+        for _ in range(min(3, self.wave_left)):
+            self.spawn_enemy()
 
     def select_minion_difficulty(self, difficulty_index):
         if not 0 <= difficulty_index < len(MINION_DIFFICULTIES):
@@ -570,17 +684,21 @@ class BattlefieldRPG:
             return "The Veil Thief"
         floor = self.stage_number()
         if self.is_minion_boss_wave():
-            return TOWER_MINIONS[(floor // 5 - 1) % len(TOWER_MINIONS)][0]
-        names = ("The Faultkeeper", "Rimebreaker", "The Red Maw", "Ironwood Colossus")
-        return names[(floor - 1) % len(names)]
+            form = self.pending_mythic_form or MYTHIC_BEASTS[0]
+            return f"{form[0]}, the Minion Demon"
+        if floor == MAX_FLOORS:
+            return "The Demon of Death and Desire"
+        return "Demon Minion"
 
     def boss_dialogue(self):
         if self.rescue_battle:
             return "Your borrowed weapon cannot touch the truth behind me!"
-        floor = self.stage_number()
         if self.is_minion_boss_wave():
-            return TOWER_MINIONS[(floor // 5 - 1) % len(TOWER_MINIONS)][1]
-        return BOSS_DIALOGUES[(floor - 1) % len(BOSS_DIALOGUES)]
+            form = self.pending_mythic_form or MYTHIC_BEASTS[0]
+            return f"{form[2]}! Face the power of the {form[1]}!"
+        if self.stage_number() == MAX_FLOORS:
+            return "The staff of Death and Desire will consume your world!"
+        return "A new battlefield awaits."
 
     def boss_skill(self):
         milestone = min(
@@ -617,6 +735,7 @@ class BattlefieldRPG:
         }
         self.superhuman_xp_earned = 0
         self.superhuman_active = True
+        self.superhuman_achieved = True
         self.player.update({
             "level": 100,
             "xp": 0,
@@ -630,6 +749,8 @@ class BattlefieldRPG:
         self.track_side_quest_progress("superhuman")
         self.message = "SUPERHUMAN AWAKENED  -  POWER LASTS UNTIL THE FLOOR BOSS FALLS"
         self.message_until = time.monotonic() + 4
+        if self.rescue_completed and not self.rescue_failed and self.stage_number() < 100:
+            self.begin_demon_arc(100)
         if save:
             self.save_game()
         return True
@@ -991,45 +1112,46 @@ class BattlefieldRPG:
         self.save_game()
 
     def on_click(self, event):
+        x, y = self.game_coordinates(event.x, event.y)
         if self.quick_loadout_open and self.state == "playing":
-            self.handle_quick_loadout_click(event.x, event.y)
+            self.handle_quick_loadout_click(x, y)
             return
         if self.state == "side_quests":
-            if 50 <= event.x <= 250 and event.y >= 555:
+            if 50 <= x <= 250 and y >= 555:
                 self.state = self.side_quests_return_state
             return
         if self.state == "quest_weapons":
-            self.handle_quest_weapons_click(event.x, event.y)
+            self.handle_quest_weapons_click(x, y)
             return
         if self.state == "side_quest_confirmation":
-            self.handle_side_quest_confirmation_click(event.x, event.y)
+            self.handle_side_quest_confirmation_click(x, y)
             return
         if self.state == "coin_gems":
-            self.handle_coin_gems_click(event.x, event.y)
+            self.handle_coin_gems_click(x, y)
             return
         if self.state == "menu":
-            if 165 <= event.x <= 465 and 331 <= event.y <= 381:
+            if 165 <= x <= 465 and 331 <= y <= 381:
                 if self.has_save():
                     self.load_game()
                 else:
                     self.start_game()
-            elif 495 <= event.x <= 795 and 331 <= event.y <= 381:
+            elif 495 <= x <= 795 and 331 <= y <= 381:
                 if self.has_save():
                     self.load_game()
                 self.open_floor_progression("menu")
-            elif self.has_save() and 165 <= event.x <= 465 and 398 <= event.y <= 448:
+            elif self.has_save() and 165 <= x <= 465 and 398 <= y <= 448:
                 self.start_game()
-            elif 495 <= event.x <= 795 and 398 <= event.y <= 448:
+            elif 495 <= x <= 795 and 398 <= y <= 448:
                 if self.has_save():
                     self.load_game()
                 self.open_quest_weapons("menu")
-            elif 165 <= event.x <= 795 and 465 <= event.y <= 515:
+            elif 165 <= x <= 795 and 465 <= y <= 515:
                 if self.has_save():
                     self.load_game()
                 self.state = "character"
             return
         if self.state == "tower_exterior":
-            if 340 <= event.x <= 620 and 330 <= event.y <= 500:
+            if 340 <= x <= 620 and 330 <= y <= 500:
                 self.start_opening_cutscene()
             return
         if self.state == "tower_gate":
@@ -1039,92 +1161,92 @@ class BattlefieldRPG:
         if self.state == "quest_select":
             for index in range(len(QUEST_OPTIONS)):
                 x1 = 80 + index * 275
-                if x1 <= event.x <= x1 + 245 and 285 <= event.y <= 470:
+                if x1 <= x <= x1 + 245 and 285 <= y <= 470:
                     self.accept_quest(index)
                     return
             return
         if self.state == "minion_difficulty":
             for index in range(len(MINION_DIFFICULTIES)):
                 x1 = 55 + index * 285
-                if x1 <= event.x <= x1 + 255 and 260 <= event.y <= 430:
+                if x1 <= x <= x1 + 255 and 260 <= y <= 430:
                     self.select_minion_difficulty(index)
                     return
             return
         if self.state == "character":
-            self.handle_character_click(event.x, event.y)
+            self.handle_character_click(x, y)
             return
         if self.state == "cosmetic_chest":
-            self.handle_cosmetic_chest_click(event.x, event.y)
+            self.handle_cosmetic_chest_click(x, y)
             return
         if self.state in ("playing", "post_boss", "boss_skill"):
-            if self.handle_boss_chest_click(event.x, event.y):
+            if self.handle_boss_chest_click(x, y):
                 return
         if (self.state in ("playing", "post_boss")
-                and 812 <= event.x <= 936 and 61 <= event.y <= 87):
+                and 812 <= x <= 936 and 61 <= y <= 87):
             self.auto_aim_enabled = not self.auto_aim_enabled
             status = "ON" if self.auto_aim_enabled else "OFF"
             self.message = f"AUTO AIM {status} FOR THIS STAGE"
             self.message_until = time.monotonic() + 1.5
             return
         if self.state == "auto_aim_prompt":
-            if 280 <= event.y <= 360:
-                if 170 <= event.x <= 460:
+            if 280 <= y <= 360:
+                if 170 <= x <= 460:
                     self.resolve_auto_aim_prompt(True)
-                elif 500 <= event.x <= 790:
+                elif 500 <= x <= 790:
                     self.resolve_auto_aim_prompt(False)
             return
         if self.state == "paused":
-            if 370 <= event.x <= 590 and 320 <= event.y <= 370:
+            if 370 <= x <= 590 and 320 <= y <= 370:
                 self.state = "playing"
                 self.last_tick = time.monotonic()
-            elif 370 <= event.x <= 590 and 390 <= event.y <= 440:
+            elif 370 <= x <= 590 and 390 <= y <= 440:
                 self.save_game()
                 self.state = "menu"
                 self.keys.clear()
-            elif 370 <= event.x <= 590 and 460 <= event.y <= 510:
+            elif 370 <= x <= 590 and 460 <= y <= 510:
                 self.restart_floor()
             return
         if self.state == "shop":
-            self.handle_shop_click(event.x, event.y)
+            self.handle_shop_click(x, y)
             return
         if self.state == "region_map":
-            if event.y > 320:
-                region_index = min(len(REGIONS) - 1, max(0, (event.x - 70) // 210))
+            if y > 320:
+                region_index = min(len(REGIONS) - 1, max(0, (x - 70) // 210))
                 self.claim_region(region_index)
             return
         if self.state == "floor_progression":
-            self.handle_progression_click(event.x, event.y)
+            self.handle_progression_click(x, y)
             return
         if self.state == "marketplace":
-            self.handle_market_click(event.x, event.y)
+            self.handle_market_click(x, y)
             return
         if self.state == "purchase_confirmation":
-            self.handle_purchase_confirmation_click(event.x, event.y)
+            self.handle_purchase_confirmation_click(x, y)
             return
         elif self.state == "skill_market":
-            self.handle_skill_market_click(event.x, event.y)
+            self.handle_skill_market_click(x, y)
             return
         elif self.state == "weapon_preview":
-            self.handle_weapon_preview_click(event.x, event.y)
+            self.handle_weapon_preview_click(x, y)
             return
         elif self.state == "skill_forge":
-            self.handle_skill_forge_click(event.x, event.y)
+            self.handle_skill_forge_click(x, y)
             return
         if self.state == "special_loadout":
-            self.handle_special_loadout_click(event.x, event.y)
+            self.handle_special_loadout_click(x, y)
             return
         if self.state == "post_boss":
-            if 340 <= event.x <= 620 and 465 <= event.y <= 500:
+            if 340 <= x <= 620 and 465 <= y <= 500:
                 self.collect_floor_coins()
                 return
             shop_left, shop_right = ((80, 260) if self.rescue_route_unlocked
                                      else (100, 300))
             terrain_left, terrain_right = ((270, 450) if self.rescue_route_unlocked
                                            else (320, 520))
-            if 545 <= event.y <= 600 and shop_left <= event.x <= shop_right:
+            if 545 <= y <= 600 and shop_left <= x <= shop_right:
                 self.open_shop()
                 return
-            elif 545 <= event.y <= 600 and terrain_left <= event.x <= terrain_right:
+            elif 545 <= y <= 600 and terrain_left <= x <= terrain_right:
                 if time.monotonic() >= self.travel_ready_at:
                     self.map_return_state = "post_boss"
                     self.state = "region_map"
@@ -1132,20 +1254,22 @@ class BattlefieldRPG:
                     self.message = f"TRAVEL OPENS IN {self.travel_ready_at - time.monotonic():.1f} SECONDS"
                     self.message_until = time.monotonic() + 1
                 return
-            if self.rescue_route_unlocked and 545 <= event.y <= 600 and 470 <= event.x <= 670:
+            if (self.rescue_route_unlocked and not self.rescue_completed
+                    and 545 <= y <= 600 and 470 <= x <= 670):
                 self.start_rescue_route()
                 return
             continue_x1 = 690 if self.rescue_route_unlocked else 650
             continue_x2 = 880 if self.rescue_route_unlocked else 850
-            if (545 <= event.y <= 600 and continue_x1 <= event.x <= continue_x2
+            if (545 <= y <= 600 and continue_x1 <= x <= continue_x2
                     and time.monotonic() >= self.travel_ready_at):
                 self.open_floor_progression("post_boss")
                 return
-            elif (545 <= event.y <= 600 and continue_x1 <= event.x <= continue_x2):
+            elif (545 <= y <= 600 and continue_x1 <= x <= continue_x2):
                 self.message = f"STAY AND COLLECT COINS FOR {self.travel_ready_at - time.monotonic():.1f} MORE SECONDS"
                 self.message_until = time.monotonic() + 1
                 return
-            dx, dy = event.x - self.player["x"], event.y - self.player["y"]
+            target_x, target_y = self.world_coordinates(x, y)
+            dx, dy = target_x - self.player["x"], target_y - self.player["y"]
             self.shoot(time.monotonic(), dx, dy)
             return
         if self.state == "gameover":
@@ -1153,13 +1277,16 @@ class BattlefieldRPG:
         elif self.state == "stage_intro":
             self.state = "playing"
         elif self.state == "playing":
-            dx, dy = event.x - self.player["x"], event.y - self.player["y"]
+            target_x, target_y = self.world_coordinates(x, y)
+            dx, dy = target_x - self.player["x"], target_y - self.player["y"]
             self.shoot(time.monotonic(), dx, dy)
 
     def on_right_click(self, event):
+        x, y = self.game_coordinates(event.x, event.y)
         if self.state not in ("playing", "post_boss", "boss_skill"):
             return
-        if self.collect_medkit_at(event.x, event.y):
+        target_x, target_y = self.world_coordinates(x, y)
+        if self.collect_medkit_at(target_x, target_y):
             return
         if self.state != "playing":
             return
@@ -1167,14 +1294,14 @@ class BattlefieldRPG:
             ability_index = self.pending_target_ability
             self.pending_target_ability = None
             self.use_boss_ability(
-                time.monotonic(), ability_index, event.x, event.y
+                time.monotonic(), ability_index, target_x, target_y
             )
             return
         if 0 <= self.active_ability < len(self.equipped_abilities):
             skill_name = self.equipped_abilities[self.active_ability][0]
             if skill_name in TARGETED_SKILLS:
                 self.use_boss_ability(
-                    time.monotonic(), self.active_ability, event.x, event.y
+                    time.monotonic(), self.active_ability, target_x, target_y
                 )
 
     def collect_medkit_at(self, x, y):
@@ -1197,7 +1324,9 @@ class BattlefieldRPG:
         return True
 
     def on_mouse_move(self, event):
-        self.mouse_position = (event.x, event.y)
+        x, y = self.game_coordinates(event.x, event.y)
+        self.mouse_screen_position = (x, y)
+        self.mouse_position = self.world_coordinates(x, y)
 
     def on_key_down(self, event):
         key = event.keysym.lower()
@@ -1206,6 +1335,19 @@ class BattlefieldRPG:
             return
         was_down = key in self.keys
         self.keys.add(key)
+        if key == "f11" and not was_down:
+            self.toggle_fullscreen()
+            return
+        if not was_down and self.state in ("playing", "post_boss"):
+            if key in ("plus", "equal"):
+                self.set_battlefield_zoom(self.battlefield_zoom + 0.1)
+                return
+            if key in ("minus", "underscore"):
+                self.set_battlefield_zoom(self.battlefield_zoom - 0.1)
+                return
+            if key == "0":
+                self.set_battlefield_zoom(1.0)
+                return
         if self.quick_loadout_open and key == "escape":
             self.quick_loadout_open = False
             self.keys.clear()
@@ -1214,8 +1356,11 @@ class BattlefieldRPG:
             self.quick_loadout_open = not self.quick_loadout_open
             self.quick_loadout_page = 0
             return
+        if key == "q" and not was_down and self.state == "playing":
+            self.summon_shadow(time.monotonic())
+            return
         if key == "q" and not was_down and self.state in (
-                "playing", "paused", "floor_progression", "marketplace",
+                "paused", "floor_progression", "marketplace",
                 "skill_market", "skill_forge"):
             self.open_quest_weapons(self.state)
             return
@@ -1319,8 +1464,7 @@ class BattlefieldRPG:
         self.player["y"] = HEIGHT - 100
         self.keys.clear()
         self.last_tick = time.monotonic()
-        self.canvas.delete("background")
-        self.draw_background()
+        self.refresh_battlefield()
         self.canvas.focus_set()
         self.save_game()
 
@@ -1371,6 +1515,7 @@ class BattlefieldRPG:
             "next_crafted_skill_id": self.next_crafted_skill_id,
             "evolved": self.evolved,
             "superhuman_active": self.superhuman_active,
+            "superhuman_achieved": self.superhuman_achieved,
             "superhuman_original_stats": self.superhuman_original_stats,
             "superhuman_xp_earned": self.superhuman_xp_earned,
             "active_ability": self.active_ability,
@@ -1387,6 +1532,11 @@ class BattlefieldRPG:
             "quests_completed": sorted(self.quests_completed),
             "tower_clues": self.tower_clues,
             "rescue_route_unlocked": self.rescue_route_unlocked,
+            "rescue_completed": self.rescue_completed,
+            "rescue_failed": self.rescue_failed,
+            "rescue_battle": self.rescue_battle,
+            "shadow_army": self.shadow_army,
+            "mentor_angel": self.mentor_angel,
         }
         temporary_path = self.save_path + ".tmp"
         try:
@@ -1421,9 +1571,10 @@ class BattlefieldRPG:
                 raise ValueError("Unsupported save version")
             floor = data["floor"]
             player_data = data["player"]
-            if (not isinstance(floor, int) or not 1 <= floor <= MAX_FLOORS
+            if (not isinstance(floor, int) or floor < 1
                     or not isinstance(player_data, dict)):
                 raise ValueError("Invalid saved floor or player data")
+            floor = min(floor, MAX_FLOORS)
 
             restored_player = {}
             for field in ("level", "xp", "next_xp", "speed", "max_hp", "hp"):
@@ -1508,6 +1659,10 @@ class BattlefieldRPG:
                 bool(data.get("superhuman_active", False))
                 and superhuman_original_stats is not None
             )
+            superhuman_achieved = bool(data.get(
+                "superhuman_achieved",
+                superhuman_active or bool(data.get("evolved", False)),
+            ))
             if bool(data.get("superhuman_active", False)) and not superhuman_active:
                 raise ValueError("Missing saved Superhuman restoration state")
             territories = data["territories"]
@@ -1600,6 +1755,27 @@ class BattlefieldRPG:
                 clue for clue in data["tower_clues"]
                 if clue in {entry[1] for entry in TOWER_MINIONS}
             ]
+            saved_shadow_army = data.get("shadow_army", [])
+            if not isinstance(saved_shadow_army, list):
+                raise ValueError("Invalid shadow army")
+            valid_beast_forms = {beast[1] for beast in MYTHIC_BEASTS}
+            shadow_army = [
+                {
+                    "name": item["name"],
+                    "form": item["form"],
+                    "ability": item["ability"],
+                }
+                for item in saved_shadow_army
+                if (isinstance(item, dict)
+                    and isinstance(item.get("name"), str)
+                    and isinstance(item.get("form"), str)
+                    and item["form"] in valid_beast_forms
+                    and isinstance(item.get("ability"), str))
+            ]
+            rescue_completed = bool(data.get("rescue_completed", False))
+            rescue_failed = bool(data.get("rescue_failed", False))
+            rescue_battle_saved = bool(data.get("rescue_battle", False))
+            mentor_angel = bool(data.get("mentor_angel", rescue_completed))
             floor_records = data.get("floor_records", {})
             if not isinstance(floor_records, dict):
                 raise ValueError("Invalid floor progression")
@@ -1647,6 +1823,7 @@ class BattlefieldRPG:
             )
             self.evolved = bool(data.get("evolved", False))
             self.superhuman_active = superhuman_active
+            self.superhuman_achieved = superhuman_achieved
             self.superhuman_original_stats = (
                 superhuman_original_stats if superhuman_active else None
             )
@@ -1676,7 +1853,13 @@ class BattlefieldRPG:
             self.equipped_cosmetics = equipped_cosmetics
             self.quests_completed = quests_completed
             self.tower_clues = tower_clues
-            self.rescue_route_unlocked = bool(data["rescue_route_unlocked"])
+            self.rescue_completed = rescue_completed
+            self.rescue_failed = rescue_failed
+            self.rescue_route_unlocked = (
+                bool(data["rescue_route_unlocked"]) and not rescue_completed
+            )
+            self.shadow_army = shadow_army
+            self.mentor_angel = mentor_angel or rescue_completed
             self.floor_number = floor
             self.floor_wave = max(
                 1, min(int(data.get("floor_wave", 1)), self.floor_wave_count(floor))
@@ -1698,6 +1881,14 @@ class BattlefieldRPG:
                 snapshot_floor = replay_snapshot.get("floor")
                 snapshot_wave = replay_snapshot.get("floor_wave")
                 snapshot_quest = replay_snapshot.get("quest_index")
+                if isinstance(snapshot_floor, int) and snapshot_floor >= 1:
+                    snapshot_floor = min(snapshot_floor, MAX_FLOORS)
+                    replay_snapshot["floor"] = snapshot_floor
+                if isinstance(snapshot_wave, int) and isinstance(snapshot_floor, int):
+                    snapshot_wave = max(
+                        1, min(snapshot_wave, self.floor_wave_count(snapshot_floor))
+                    )
+                    replay_snapshot["floor_wave"] = snapshot_wave
                 if (not isinstance(snapshot_floor, int)
                         or not 1 <= snapshot_floor <= MAX_FLOORS
                         or not isinstance(snapshot_wave, int)
@@ -1752,6 +1943,9 @@ class BattlefieldRPG:
                 self.state = "quest_select"
             self.keys.clear()
             self.award_side_quests(save=False)
+            if (rescue_battle_saved and self.rescue_route_unlocked
+                    and not self.rescue_completed):
+                self.start_rescue_route()
             self.save_game()
             self.canvas.delete("background")
             self.draw_background()
@@ -1813,6 +2007,28 @@ class BattlefieldRPG:
         self.save_game()
 
     def restart_stage(self):
+        if self.rescue_battle:
+            self.rescue_battle = False
+            self.rescue_failed = True
+            self.enemies.clear()
+            self.projectiles.clear()
+            self.effects.clear()
+            self.player.update(
+                x=WIDTH / 2,
+                y=(ARENA[1] + ARENA[3]) / 2,
+                hp=self.player["max_hp"],
+                hurt_until=0,
+                knockdown_until=0,
+                shield_until=0,
+                frozen_until=0,
+            )
+            self.state = "post_boss"
+            self.travel_ready_at = time.monotonic()
+            self.message = "RESCUE FAILED  -  PREPARE AND TRY THE RESCUE AGAIN"
+            self.message_until = time.monotonic() + 3
+            self.keys.clear()
+            self.save_game()
+            return
         self.floor_wave = 1
         self.encounter_clear = False
         self.minion_difficulty = None
@@ -1834,6 +2050,7 @@ class BattlefieldRPG:
         self.effects.clear()
         self.boss_corpses.clear()
         self.boss_chests.clear()
+        self.shadow_ally = None
         self.wave_pause = 0
         self.pending_skill = None
         self.skill_acquire_progress = 0
@@ -1845,12 +2062,18 @@ class BattlefieldRPG:
         self.state = "stage_intro"
         self.stage_intro_until = time.monotonic() + 2.2
         self.keys.clear()
-        self.canvas.delete("background")
-        self.draw_background()
+        self.refresh_battlefield()
         self.spawn_wave()
         self.message = f"{self.stage_label()} RESTARTED"
         self.message_until = self.stage_intro_until
         self.last_tick = time.monotonic()
+        self.save_game()
+
+    def handle_player_defeat(self):
+        if self.rescue_battle:
+            self.rescue_failed = True
+        self.state = "gameover"
+        self.keys.clear()
         self.save_game()
 
     def restart_floor(self):
@@ -1859,32 +2082,61 @@ class BattlefieldRPG:
         self.floor_kills_start = self.kills
         self.restart_stage()
 
-    def spawn_enemy(self):
+    def spawn_enemy(self, side=None):
         if self.floor_wave > self.regular_waves_per_floor():
             if self.state == "playing":
                 self.state = "boss_warning"
                 self.boss_warning_until = time.monotonic() + 3
             return
 
-        side = random.randrange(4)
+        side = random.randrange(4) if side is None else side
+        edge_left = ARENA[0] + 36
+        edge_right = ARENA[2] - 36
+        edge_top = ARENA[1] + 36
+        edge_bottom = ARENA[3] - 36
         if side == 0:
-            x, y = random.uniform(ARENA[0], ARENA[2]), ARENA[1] + 12
+            x, y = random.uniform(edge_left, edge_right), edge_top
         elif side == 1:
-            x, y = random.uniform(ARENA[0], ARENA[2]), ARENA[3] - 12
+            x, y = random.uniform(edge_left, edge_right), edge_bottom
         elif side == 2:
-            x, y = ARENA[0] + 12, random.uniform(ARENA[1], ARENA[3])
+            x, y = edge_left, random.uniform(edge_top, edge_bottom)
         else:
-            x, y = ARENA[2] - 12, random.uniform(ARENA[1], ARENA[3])
+            x, y = edge_right, random.uniform(edge_top, edge_bottom)
 
-        if self.wave >= 3 and random.random() < 0.24:
+        style_index = (self.stage_number() - 1) % 4
+        roll = random.random()
+        demon_phase = self.rescue_completed and 101 <= self.stage_number() <= MAX_FLOORS
+        if demon_phase:
+            kind = random.choice(DEMON_ENEMY_KINDS)
+            demon_stats = {
+                "winged_demon": (62, 115, 16, 28, 15),
+                "horned_demon": (105, 52, 27, 35, 19),
+                "gravity_mage": (48, 62, 18, 30, 13),
+                "staff_demon": (72, 72, 22, 38, 15),
+            }
+            hp, speed, damage, xp, radius = demon_stats[kind]
+        elif style_index == 2 and roll < 0.48:
+            kind = "brute"
+            hp, speed, damage, xp, radius = 92, 45, 20, 30, 17
+        elif style_index == 1 and roll < 0.56:
+            kind = "ranger"
+            hp, speed, damage, xp, radius = 32, 75, 10, 15, 11
+        elif style_index == 3 and roll < 0.58:
+            kind = "raider"
+            hp, speed, damage, xp, radius = 48, 94, 15, 20, 13
+        elif self.wave >= 3 and roll < 0.24:
             kind = "brute"
             hp, speed, damage, xp, radius = 72, 48, 17, 24, 16
-        elif self.wave >= 2 and random.random() < 0.38:
+        elif self.wave >= 2 and roll < 0.62:
             kind = "ranger"
             hp, speed, damage, xp, radius = 28, 83, 8, 12, 11
         else:
             kind = "raider"
             hp, speed, damage, xp, radius = 42, 64, 11, 16, 13
+        floor_scale = 1 + min(self.stage_number() - 1, 80) * 0.035
+        hp = math.ceil(hp * floor_scale)
+        damage = math.ceil(damage * floor_scale)
+        xp = math.ceil(xp * (1 + (self.stage_number() - 1) * 0.025))
         self.enemies.append(
             {
                 "x": x,
@@ -1898,58 +2150,67 @@ class BattlefieldRPG:
                 "kind": kind,
                 "attack_ready": 0,
                 "hurt_until": 0,
+                "special_ready": time.monotonic() + random.uniform(2.5, 5),
             }
         )
         self.wave_left -= 1
 
     def spawn_boss(self):
-        x, y = ARENA[2] - 75, ARENA[1] + 85
         is_rescue_boss = self.rescue_battle
         is_minion_boss = self.is_minion_boss_wave() and not is_rescue_boss
-        kind = "kidnapper" if is_rescue_boss else (
-            "minion_boss" if is_minion_boss else "boss"
-        )
+        is_final_boss = self.stage_number() == MAX_FLOORS and not is_rescue_boss
         minion_clue = None
         if is_minion_boss:
-            clue_index = min(self.stage_number() // 5 - 1, len(TOWER_MINIONS) - 1)
+            clue_index = MINION_BOSS_FLOORS.index(self.stage_number())
             minion_clue = TOWER_MINIONS[clue_index][1]
         floor = self.stage_number()
-        difficulty = None
-        if is_minion_boss:
-            difficulty = self.minion_difficulty
-            if difficulty is None:
-                difficulty = 0
-            base_hp = MINION_DIFFICULTIES[difficulty][1]
-        else:
-            base_hp = 1_000 + (floor - 1) * 1_000
-        self.enemies.append(
-            {
-                "x": x,
-                "y": y,
-                "hp": base_hp,
-                "max_hp": base_hp,
-                "speed": 36 if is_minion_boss else 42,
-                "damage": 8 if is_minion_boss else 15,
-                "xp": 1_000 + floor * 250,
-                "radius": 30,
-                "kind": kind,
-                "attack_ready": 0,
-                "hurt_until": 0,
-                "special_ready": time.monotonic() + 2.5,
-                "special_until": 0,
-                "special_hit": False,
-                "special_line": None,
-                "boss_name": self.boss_name(),
+        difficulty = self.minion_difficulty if is_minion_boss else None
+        if is_minion_boss and difficulty is None:
+            difficulty = 0
+        form = self.pending_mythic_form if is_minion_boss else None
+        now = time.monotonic()
+
+        def make_boss(kind, name, x, y, radius, hp, damage, mythic_form=None):
+            self.enemies.append({
+                "x": x, "y": y, "hp": hp, "max_hp": hp,
+                "speed": 36 if kind == "minion_boss" else 42,
+                "damage": damage, "xp": 1_000 + floor * 250,
+                "radius": radius, "kind": kind, "attack_ready": now,
+                "hurt_until": 0, "special_ready": now + 2.5,
+                "special_until": 0, "special_hit": False,
+                "special_line": None, "boss_name": name,
                 "skill": None if is_rescue_boss else self.boss_skill(),
                 "skills": [] if is_rescue_boss else self.boss_skills(),
-                "next_skill_index": 0,
-                "clue": minion_clue,
+                "next_skill_index": 0, "clue": minion_clue,
                 "difficulty": difficulty if is_minion_boss else None,
-                "floor_final_boss": self.floor_wave == self.floor_wave_count(),
-                "teleport_ready": time.monotonic() + 3,
-                "clone_ready": time.monotonic() + 5,
-            }
-        )
+                "floor_final_boss": is_final_boss or is_rescue_boss,
+                "teleport_ready": now + 3, "clone_ready": now + 5,
+                "mythic_form": mythic_form,
+                "mythic_ability": form[2] if form else "",
+                "mythic_special_ready": now + 4,
+            })
+
+        center_y = (ARENA[1] + ARENA[3]) / 2
+        if is_rescue_boss:
+            make_boss("kidnapper", "The Veil Thief", ARENA[2] - 80,
+                      center_y, 30, 80_000, 15)
+        elif is_minion_boss:
+            beast_name, beast_form, ability, _ = form or MYTHIC_BEASTS[0]
+            boss_name = f"{beast_name}, the {beast_form.title()} Minion"
+            hp = MINION_DIFFICULTIES[difficulty][1]
+            make_boss("minion_boss", boss_name, ARENA[2] - 160, center_y,
+                      self.player_radius() * 10, hp, 8, beast_form)
+            self.enemies[-1]["mythic_ability"] = ability
+        elif is_final_boss:
+            make_boss("final_demon", "The Demon of Death and Desire",
+                      ARENA[2] - 170, center_y, 48, 700_000, 48,
+                      "staff_demon")
+            make_boss("fire_yeti", "The Fire-Breathing Yeti",
+                      ARENA[2] - 310, center_y - 125, 62, 350_000, 35,
+                      "fire_yeti")
+            make_boss("ice_yeti", "The Ice-Breathing Yeti",
+                      ARENA[2] - 310, center_y + 125, 62, 350_000, 35,
+                      "ice_yeti")
 
     def update_flow(self, now):
         if self.state == "opening_cutscene" and now - self.opening_cutscene_started >= 12:
@@ -1982,8 +2243,26 @@ class BattlefieldRPG:
                 self.message = self.clue_dialogue
                 self.message_until = now + 3
         elif self.state == "kidnapper_reveal" and now >= self.kidnapper_reveal_until:
-            self.state = "victory"
             self.rescue_battle = False
+            self.rescue_completed = True
+            self.rescue_route_unlocked = False
+            self.mentor_angel = True
+            self.rescue_failed = False
+            if (self.superhuman_achieved or self.superhuman_active
+                    or self.evolved or self.player["level"] >= 100):
+                self.begin_demon_arc(100)
+                self.message = (
+                    "RESCUE COMPLETE  -  YOUR SUPERHUMAN AWAKENING CARRIES "
+                    "YOU TO FLOOR 100"
+                )
+            else:
+                self.begin_demon_arc(26)
+                self.message = "RESCUE COMPLETE  -  THE ANGEL WILL GUIDE YOUR CLIMB TO FLOOR 100"
+            self.message_until = now + 5
+        elif self.state == "angel_guide" and now >= self.angel_guide_until:
+            self.state = "quest_select"
+            self.prepare_quest_options()
+            self.save_game()
 
     def continue_stage(self):
         if self.floor_wave < self.floor_wave_count():
@@ -2037,9 +2316,15 @@ class BattlefieldRPG:
             self.message_until = time.monotonic() + 3
             self.save_game()
             return
+        if (self.rescue_route_unlocked and not self.rescue_completed
+                and self.stage_number() >= MINION_BOSS_FLOORS[-1]):
+            self.state = "post_boss"
+            self.message = "FOLLOW THE RESCUE ROUTE BEFORE CLIMBING FURTHER"
+            self.message_until = time.monotonic() + 2.5
+            return
         if self.stage_number() >= MAX_FLOORS:
             self.state = "victory"
-            self.message = "THE 200TH FLOOR IS YOURS. THE TOWER IS CONQUERED."
+            self.message = "THE 150TH FLOOR IS YOURS. THE TOWER IS CONQUERED."
             self.save_game()
             return
         self.begin_floor(self.stage_number() + 1)
@@ -2544,6 +2829,88 @@ class BattlefieldRPG:
             self.message = "NO FLOOR COINS LEFT TO COLLECT"
         self.message_until = time.monotonic() + 2.5
 
+    def attempt_shadow_binding(self, enemy):
+        for _ in range(3):
+            if random.random() < 0.25:
+                shadow = {
+                    "name": enemy["boss_name"],
+                    "form": enemy.get("mythic_form") or "wolf",
+                    "ability": enemy.get("mythic_ability") or "SHADOW STRIKE",
+                }
+                self.shadow_army.append(shadow)
+                return f"SHADOW BOUND: {shadow['name']}"
+        return "SHADOW BINDING FAILED  -  ALL 3 CHANCES USED"
+
+    def summon_shadow(self, now):
+        if self.shadow_ally is not None:
+            self.message = "A SHADOW ALLY IS ALREADY FIGHTING"
+        elif now < self.shadow_cooldown_until:
+            self.message = f"SHADOW COOLDOWN  -  {self.shadow_cooldown_until - now:.1f}s"
+        elif not self.shadow_army:
+            self.message = "NO SHADOWS BOUND  -  DEFEAT A MINION BOSS"
+        else:
+            shadow = self.shadow_army[0]
+            self.shadow_ally = {
+                **shadow,
+                "x": max(ARENA[0] + 30, self.player["x"] - 45),
+                "y": self.player["y"] + 30,
+                "radius": 34,
+                "until": now + 18,
+                "attack_ready": now + 0.6,
+                "special_ready": now + 4,
+            }
+            self.shadow_cooldown_until = now + 30
+            self.message = f"SHADOW SUMMONED  -  {shadow['name']} FIGHTS BESIDE YOU"
+            self.save_game()
+        self.message_until = now + 2
+
+    def update_shadow_ally(self, now, dt):
+        ally = self.shadow_ally
+        if ally is None:
+            return
+        if now >= ally["until"]:
+            self.shadow_ally = None
+            self.message = "YOUR SHADOW ALLY RETURNS TO THE ARMY"
+            self.message_until = now + 1.5
+            return
+        target = min(
+            self.enemies,
+            key=lambda enemy: (enemy["x"] - ally["x"]) ** 2
+            + (enemy["y"] - ally["y"]) ** 2,
+            default=None,
+        )
+        if target is None:
+            return
+        dx, dy = target["x"] - ally["x"], target["y"] - ally["y"]
+        distance = max(1, math.hypot(dx, dy))
+        if distance > target["radius"] + ally["radius"] + 12:
+            ally["x"] += dx / distance * 240 * dt
+            ally["y"] += dy / distance * 240 * dt
+        if now < ally["attack_ready"] or distance > 180:
+            return
+        special = now >= ally["special_ready"]
+        damage = 3_200 if special else 1_500
+        targets = [
+            enemy for enemy in self.enemies
+            if (not special or math.hypot(
+                enemy["x"] - target["x"], enemy["y"] - target["y"]
+            ) <= 115)
+        ]
+        for enemy in targets:
+            enemy["hp"] -= damage
+            enemy["hurt_until"] = now + 0.12
+            if enemy["hp"] <= 0:
+                self.defeat_enemy(enemy, now)
+        ally["attack_ready"] = now + 0.9
+        if special:
+            ally["special_ready"] = now + 5
+            self.message = f"{ally['name']} UNLEASHES {ally['ability']}!"
+            self.message_until = now + 1.5
+            self.effects.append({
+                "kind": "burst", "x": target["x"], "y": target["y"],
+                "until": now + 0.35,
+            })
+
     def resolve_auto_aim_prompt(self, enabled):
         self.auto_aim_enabled = enabled
         self.show_next_quest()
@@ -2554,9 +2921,10 @@ class BattlefieldRPG:
         self.state = "quest_select"
 
     def start_rescue_route(self):
-        if not self.rescue_route_unlocked:
+        if not self.rescue_route_unlocked or self.rescue_completed:
             return
         self.rescue_battle = True
+        self.rescue_failed = False
         self.active_quest = None
         self.demon_ally_next_attack = time.monotonic() + 0.8
         self.wave_pause = 0
@@ -2568,9 +2936,41 @@ class BattlefieldRPG:
         self.player["y"] = (ARENA[1] + ARENA[3]) / 2
         self.state = "boss_warning"
         self.boss_warning_until = time.monotonic() + 3
-        self.message = "THE FIVE CLUES OPEN A PATH TO THE TOP FLOOR"
+        self.message = "FOLLOW THE PIXEL GOD'S LIGHT  -  RESCUE THE DEMON KING"
         self.message_until = self.boss_warning_until
+        self.mentor_text = (
+            "PIXEL GOD: Follow my light through the throne passage. "
+            "The Demon King is close."
+        )
+        self.mentor_until = self.boss_warning_until + 9
+        self.audio.speak(self.mentor_text)
         self.keys.clear()
+
+    def begin_demon_arc(self, floor):
+        self.floor_number = max(26, min(100, floor))
+        self.floor_wave = 1
+        self.active_quest = None
+        self.quest_progress = 0
+        self.quest_complete = False
+        self.encounter_clear = False
+        self.enemies.clear()
+        self.pickups.clear()
+        self.projectiles.clear()
+        self.effects.clear()
+        self.boss_corpses.clear()
+        self.boss_chests.clear()
+        self.pending_skill = None
+        self.shadow_ally = None
+        self.rescue_battle = False
+        self.mentor_angel = True
+        self.mentor_text = (
+            "ANGEL GUIDE: The Demon King is safe. Fifty demon floors remain."
+        )
+        self.mentor_until = time.monotonic() + 7
+        self.audio.speak(self.mentor_text)
+        self.angel_guide_until = time.monotonic() + 5
+        self.state = "angel_guide"
+        self.save_game()
 
     def begin_stage(self):
         self.state = "stage_intro"
@@ -2745,11 +3145,27 @@ class BattlefieldRPG:
             length = math.hypot(dx, dy)
             dx, dy = dx / length, dy / length
             p["face"] = (dx, dy)
-            p["x"] += dx * p["speed"] * dt
-            p["y"] += dy * p["speed"] * dt
-            p["x"] = max(ARENA[0] + 16, min(ARENA[2] - 16, p["x"]))
-            p["y"] = max(ARENA[1] + 16, min(ARENA[3] - 16, p["y"]))
+            movement_speed = p["speed"] * (
+                0.6 if now < p.get("slowed_until", 0) else 1
+            )
+            p["x"] += dx * movement_speed * dt
+            p["y"] += dy * movement_speed * dt
+            center_x = (ARENA[0] + ARENA[2]) / 2
+            center_y = (ARENA[1] + ARENA[3]) / 2
+            scroll_x = 0
+            scroll_y = 0
+            if p["x"] > center_x + 160:
+                scroll_x = p["x"] - (center_x + 160)
+            elif p["x"] < center_x - 160:
+                scroll_x = p["x"] - (center_x - 160)
+            if p["y"] > center_y + 105:
+                scroll_y = p["y"] - (center_y + 105)
+            elif p["y"] < center_y - 105:
+                scroll_y = p["y"] - (center_y - 105)
+            if scroll_x or scroll_y:
+                self.scroll_world(scroll_x, scroll_y, now)
 
+        self.mouse_position = self.world_coordinates(*self.mouse_screen_position)
         mouse_dx = self.mouse_position[0] - p["x"]
         mouse_dy = self.mouse_position[1] - p["y"]
         if math.hypot(mouse_dx, mouse_dy) > 8:
@@ -2769,10 +3185,37 @@ class BattlefieldRPG:
                 continue
             ex, ey = p["x"] - enemy["x"], p["y"] - enemy["y"]
             distance = max(1, math.hypot(ex, ey))
-            if distance > enemy["radius"] + self.player_radius() + 5:
+            if enemy["kind"] in ("gravity_mage", "staff_demon") and 140 < distance < 460:
+                if now >= enemy["attack_ready"]:
+                    self.projectiles.append({
+                        "x": enemy["x"], "y": enemy["y"],
+                        "vx": ex / distance * 240,
+                        "vy": ey / distance * 240,
+                        "damage": enemy["damage"], "life": 2.4,
+                        "kind": "gravity_orb" if enemy["kind"] == "gravity_mage"
+                        else "staff_orb",
+                        "owner": enemy,
+                    })
+                    enemy["attack_ready"] = now + 2.1
+            elif enemy["kind"] == "ranger" and 135 < distance < 360:
+                if now >= enemy["attack_ready"]:
+                    self.projectiles.append({
+                        "x": enemy["x"], "y": enemy["y"],
+                        "vx": ex / distance * 260,
+                        "vy": ey / distance * 260,
+                        "damage": enemy["damage"], "life": 2.2,
+                        "kind": "enemy_bolt", "owner": enemy,
+                    })
+                    enemy["attack_ready"] = now + 1.65
+            elif (distance > enemy["radius"] + self.player_radius() + 5
+                  and (enemy["kind"] != "ranger" or distance >= 190)):
                 speed = enemy["speed"] * (0.45 if now < enemy.get("slowed_until", 0) else 1)
                 enemy["x"] += ex / distance * speed * dt
                 enemy["y"] += ey / distance * speed * dt
+            elif enemy["kind"] == "ranger" and distance < 135:
+                speed = enemy["speed"] * dt
+                enemy["x"] -= ex / distance * speed
+                enemy["y"] -= ey / distance * speed
             elif now >= enemy["attack_ready"] and now >= p["hurt_until"] and now >= p["knockdown_until"]:
                 shielded = now < p["shield_until"]
                 if not shielded:
@@ -2783,13 +3226,17 @@ class BattlefieldRPG:
                 self.message_until = now + 0.65
                 if p["hp"] <= 0:
                     p["hp"] = 0
-                    self.state = "gameover"
-                    self.keys.clear()
+                    self.handle_player_defeat()
                     return
-            if enemy["kind"] in ("boss", "minion_boss"):
+            if enemy["kind"] in (
+                    "boss", "minion_boss", "final_demon",
+                    "fire_yeti", "ice_yeti"):
                 self.update_boss(enemy, now)
             elif enemy["kind"] == "kidnapper":
                 self.update_kidnapper(enemy, now)
+
+        if self.state == "playing":
+            self.update_shadow_ally(now, dt)
 
         for projectile in self.projectiles[:]:
             if (now < self.time_freeze_until
@@ -2798,6 +3245,35 @@ class BattlefieldRPG:
             projectile["x"] += projectile["vx"] * dt
             projectile["y"] += projectile["vy"] * dt
             projectile["life"] -= dt
+            if projectile.get("kind") in (
+                    "enemy_bolt", "gravity_orb", "staff_orb", "wind_bolt",
+                    "venom_orb", "fire_breath", "ice_breath", "spike_bolt"):
+                if (math.hypot(projectile["x"] - p["x"],
+                               projectile["y"] - p["y"]) <= self.player_radius() + 5
+                        and now >= p["hurt_until"]
+                        and now >= p["knockdown_until"]):
+                    if now >= p["shield_until"]:
+                        p["hp"] = max(0, p["hp"] - projectile["damage"])
+                    owner = projectile.get("owner")
+                    if projectile["kind"] == "gravity_orb" and owner:
+                        pull_x, pull_y = owner["x"] - p["x"], owner["y"] - p["y"]
+                        pull_length = max(1, math.hypot(pull_x, pull_y))
+                        p["x"] += pull_x / pull_length * 55
+                        p["y"] += pull_y / pull_length * 55
+                        p["knockdown_until"] = now + 0.5
+                    elif projectile["kind"] == "ice_breath":
+                        p["slowed_until"] = now + 1.5
+                    p["hurt_until"] = now + 0.58
+                    if p["hp"] <= 0:
+                        self.handle_player_defeat()
+                        return
+                    self.projectiles.remove(projectile)
+                    continue
+                if (projectile["life"] <= 0
+                        or not (ARENA[0] <= projectile["x"] <= ARENA[2]
+                                and ARENA[1] <= projectile["y"] <= ARENA[3])):
+                    self.projectiles.remove(projectile)
+                continue
             hit = False
             for enemy in self.enemies[:]:
                 if math.hypot(projectile["x"] - enemy["x"],
@@ -2862,6 +3338,14 @@ class BattlefieldRPG:
                     self.floor_wave += 1
                     self.wave += 1
                     self.spawn_wave()
+                else:
+                    self.encounter_clear = True
+                    self.record_floor_clear()
+                    self.state = "post_boss"
+                    self.travel_ready_at = now
+                    self.message = "FLOOR SECURED  -  THE NEXT PATH IS OPEN"
+                    self.message_until = now + 2
+                    self.save_game()
 
         if self.rescue_battle and now >= self.demon_ally_next_attack:
             target = next(
@@ -2878,6 +3362,72 @@ class BattlefieldRPG:
                 })
                 if target["hp"] <= 0:
                     self.defeat_enemy(target, now)
+
+    def scroll_world(self, scroll_x, scroll_y, now):
+        previous_cell = (
+            math.floor(self.camera_x / TERRAIN_TILE_SIZE),
+            math.floor(self.camera_y / TERRAIN_TILE_SIZE),
+        )
+
+        def shift_point(entity):
+            entity["x"] -= scroll_x
+            entity["y"] -= scroll_y
+
+        shift_point(self.player)
+        for collection in (
+            self.enemies, self.pickups, self.projectiles,
+            self.boss_corpses, self.boss_chests,
+        ):
+            for entity in collection:
+                shift_point(entity)
+                line = entity.get("special_line")
+                if line:
+                    entity["special_line"] = (
+                        line[0] - scroll_x, line[1] - scroll_y,
+                        line[2] - scroll_x, line[3] - scroll_y,
+                    )
+        if self.shadow_ally is not None:
+            shift_point(self.shadow_ally)
+        for effect in self.effects:
+            if "x" in effect:
+                effect["x"] -= scroll_x
+            if "y" in effect:
+                effect["y"] -= scroll_y
+            if "start_y" in effect:
+                effect["start_y"] -= scroll_y
+            line = effect.get("line")
+            if line:
+                effect["line"] = (
+                    line[0] - scroll_x, line[1] - scroll_y,
+                    line[2] - scroll_x, line[3] - scroll_y,
+                )
+
+        self.camera_x += scroll_x
+        self.camera_y += scroll_y
+        self.canvas.move(
+            "background",
+            -scroll_x * self.view_scale_x * self.battlefield_zoom,
+            -scroll_y * self.view_scale_y * self.battlefield_zoom,
+        )
+        current_cell = (
+            math.floor(self.camera_x / TERRAIN_TILE_SIZE),
+            math.floor(self.camera_y / TERRAIN_TILE_SIZE),
+        )
+        if current_cell != previous_cell:
+            self.refresh_battlefield()
+
+        if (self.state == "playing" and self.wave_left > 0
+                and now >= self.last_frontier_spawn_at + 1.1):
+            frontier_capacity = 7 + self.wave
+            available_slots = frontier_capacity - len(self.enemies)
+            if available_slots > 0:
+                if abs(scroll_x) >= abs(scroll_y):
+                    spawn_side = 3 if scroll_x > 0 else 2
+                else:
+                    spawn_side = 1 if scroll_y > 0 else 0
+                for _ in range(min(2, self.wave_left, available_slots)):
+                    self.spawn_enemy(spawn_side)
+                self.last_frontier_spawn_at = now
 
     def update_kidnapper(self, boss, now):
         if now >= boss["teleport_ready"]:
@@ -2922,7 +3472,68 @@ class BattlefieldRPG:
             self.message = "A VEIL THIEF CLONE STEPS OUT OF THE SHADOWS!"
             self.message_until = now + 1.4
 
+    def update_mythic_boss(self, boss, now):
+        if now < boss["mythic_special_ready"]:
+            return
+        player = self.player
+        form = boss["mythic_form"]
+        dx, dy = player["x"] - boss["x"], player["y"] - boss["y"]
+        distance = max(1, math.hypot(dx, dy))
+        direction = (dx / distance, dy / distance)
+        if form == "wolf":
+            boss["x"] = max(
+                ARENA[0] + boss["radius"],
+                min(ARENA[2] - boss["radius"],
+                    player["x"] - direction[0] * (boss["radius"] + 30)),
+            )
+            boss["y"] = max(
+                ARENA[1] + boss["radius"],
+                min(ARENA[3] - boss["radius"],
+                    player["y"] - direction[1] * (boss["radius"] + 30)),
+            )
+            self.effects.append({
+                "kind": "burst", "x": boss["x"], "y": boss["y"],
+                "until": now + 0.4,
+            })
+            if distance < boss["radius"] + 145 and now >= player["hurt_until"]:
+                if now >= player["shield_until"]:
+                    player["hp"] = max(0, player["hp"] - 35)
+                player["hurt_until"] = now + 0.8
+                if player["hp"] <= 0:
+                    self.handle_player_defeat()
+        else:
+            projectile_kind = {
+                "griffin": "wind_bolt",
+                "hydra": "venom_orb",
+                "cerberus": "fire_breath",
+                "chimera": "spike_bolt",
+                "staff_demon": "gravity_orb",
+                "fire_yeti": "fire_breath",
+                "ice_yeti": "ice_breath",
+            }.get(form, "enemy_bolt")
+            count = 5 if form in ("staff_demon", "fire_yeti", "ice_yeti") else 3
+            spread = 0.12 if count == 5 else 0.08
+            for index in range(count):
+                angle = (index - (count - 1) / 2) * spread
+                shot_x = direction[0] * math.cos(angle) - direction[1] * math.sin(angle)
+                shot_y = direction[0] * math.sin(angle) + direction[1] * math.cos(angle)
+                self.projectiles.append({
+                    "x": boss["x"], "y": boss["y"],
+                    "vx": shot_x * 260, "vy": shot_y * 260,
+                    "damage": boss["damage"], "life": 2.6,
+                    "kind": projectile_kind, "owner": boss,
+                })
+        ability = boss.get("mythic_ability") or form.replace("_", " ").upper()
+        self.message = f'{boss["boss_name"]}: {ability}!'
+        self.message_until = now + 1.4
+        boss["mythic_special_ready"] = now + (
+            7 if form == "wolf" else 4.5
+        )
+
     def update_boss(self, boss, now):
+        if boss.get("mythic_form"):
+            self.update_mythic_boss(boss, now)
+            return
         if now >= boss["special_ready"] and boss["special_until"] <= 0:
             p = self.player
             skills = boss.get("skills") or [boss["skill"]]
@@ -3019,8 +3630,7 @@ class BattlefieldRPG:
                 self.message_until = now + 1.4
                 boss["special_hit"] = True
                 if p["hp"] <= 0:
-                    self.state = "gameover"
-                    self.keys.clear()
+                    self.handle_player_defeat()
             self.effects.append({"kind": "fissure", "line": boss["special_line"],
                                  "until": now + 0.65, "skill": boss["skill"][0]})
             if skill_name == "Frost Nova":
@@ -3076,6 +3686,7 @@ class BattlefieldRPG:
             self.player["xp"] += enemy["xp"]
         quest_just_completed = False
         minion_coin_reward = None
+        shadow_result = None
         end_superhuman_after_boss = False
         if self.active_quest and not self.quest_complete:
             self.quest_progress += 1
@@ -3087,13 +3698,37 @@ class BattlefieldRPG:
                 self.message = f"QUEST COMPLETE  +{self.quest_reward} COINS"
                 self.message_until = now + 2.5
 
-        if enemy["kind"] in ("boss", "minion_boss", "kidnapper"):
+        final_team = ("final_demon", "fire_yeti", "ice_yeti")
+        if (enemy["kind"] in final_team
+                and any(member["kind"] in final_team for member in self.enemies)):
+            self.coins += 20
+            self.boss_corpses.append({
+                "x": enemy["x"], "y": enemy["y"],
+                "name": enemy["boss_name"], "skill": self.boss_skill(),
+            })
+            self.effects.append({
+                "kind": "burst", "x": enemy["x"], "y": enemy["y"],
+                "until": now + 0.3,
+            })
+            self.message = (
+                f'{enemy["boss_name"]} FALLS  -  '
+                f'{sum(member["kind"] in final_team for member in self.enemies)} '
+                "FINAL ENEMIES REMAIN"
+            )
+            self.message_until = now + 2
+            self.save_game()
+            return
+
+        if enemy["kind"] in (
+                "boss", "minion_boss", "kidnapper", *final_team):
             self.encounter_clear = True
             is_final_boss = enemy.get(
                 "floor_final_boss",
                 enemy["kind"] != "minion_boss",
             )
-            end_superhuman_after_boss = is_final_boss
+            end_superhuman_after_boss = (
+                is_final_boss and enemy["kind"] != "kidnapper"
+            )
             if enemy["kind"] == "minion_boss":
                 difficulty = enemy.get("difficulty", self.minion_difficulty or 0)
                 reward = MINION_DIFFICULTIES[difficulty][2]
@@ -3139,20 +3774,32 @@ class BattlefieldRPG:
                     clue = enemy["clue"]
                     if clue and clue not in self.tower_clues:
                         self.tower_clues.append(clue)
+                    shadow_result = self.attempt_shadow_binding(enemy)
                     if len(self.tower_clues) >= len(TOWER_MINIONS):
                         self.rescue_route_unlocked = True
                         self.advanced_gun_owned = True
                         self.owned_cosmetics["GUN"].add("Warden Breaker")
                         self.equipped_cosmetics["GUN"] = "Warden Breaker"
                     self.clue_dialogue = f"{enemy['boss_name']}: \"{enemy['clue']}\""
-                    if enemy["skill"] in MILESTONE_BOSS_SKILLS:
-                        self.pending_skill = enemy["skill"]
-                        self.skill_acquire_progress = 0
+                    if len(self.tower_clues) >= len(TOWER_MINIONS):
+                        self.mentor_text = (
+                            "PIXEL GOD: All five clues are yours. Follow the glowing "
+                            "Rescue Route and find the Demon King."
+                        )
+                    else:
+                        self.mentor_text = (
+                            f"PIXEL GOD: Good work. Clue {len(self.tower_clues)} of "
+                            f"{len(TOWER_MINIONS)} found. Keep going, warrior."
+                        )
+                    self.mentor_until = now + 14
+                    self.pending_skill = enemy["skill"]
+                    self.skill_acquire_progress = 0
                     self.state = "minion_reveal"
                     self.boss_dialogue_until = now + 5
                     self.message = "A TOWER MINION HAS LEFT A CLUE"
                     self.message_until = self.boss_dialogue_until
                     self.audio.speak(self.clue_dialogue)
+                    self.audio.speak(self.mentor_text)
                 else:
                     self.pending_skill = enemy["skill"]
                     self.skill_acquire_progress = 0
@@ -3175,10 +3822,13 @@ class BattlefieldRPG:
         if end_superhuman_after_boss:
             self.end_superhuman(save=False)
         if minion_coin_reward is not None:
-            self.message = f"DEMON MINION DEFEATED  +{minion_coin_reward:,} COINS"
+            self.message = (
+                f"DEMON MINION DEFEATED  +{minion_coin_reward:,} COINS"
+                + (f"  |  {shadow_result}" if shadow_result else "")
+            )
             self.message_until = now + 3
         if quest_just_completed or enemy["kind"] in (
-                "boss", "minion_boss", "kidnapper"):
+                "boss", "minion_boss", "kidnapper", *final_team):
             self.save_game()
 
     def use_boss_ability(self, now, ability_index=None,
@@ -3365,8 +4015,7 @@ class BattlefieldRPG:
                 )
             self.player["hurt_until"] = now + 0.8
             if self.player["hp"] <= 0:
-                self.state = "gameover"
-                self.keys.clear()
+                self.handle_player_defeat()
 
     def boss_ability_cooldown(self):
         return 7 * 0.7 if self.boss_weapon_owned else 7
@@ -3383,8 +4032,7 @@ class BattlefieldRPG:
         self.player["x"] = WIDTH / 2
         self.player["y"] = (ARENA[1] + ARENA[3]) / 2
         self.projectiles.clear()
-        self.canvas.delete("background")
-        self.draw_background()
+        self.refresh_battlefield()
         if post_boss:
             self.pending_skill = None
             self.boss_corpses.clear()
@@ -3438,103 +4086,88 @@ class BattlefieldRPG:
         c = self.canvas
         _, ground, border, grid = REGIONS[self.region]
         accent = REGION_ACCENTS[self.region]
-        c.create_rectangle(0, 0, WIDTH, HEIGHT, fill="#151a20",
+        half_width = WIDTH / (2 * self.battlefield_zoom) + TERRAIN_TILE_SIZE * 2
+        half_height = HEIGHT / (2 * self.battlefield_zoom) + TERRAIN_TILE_SIZE * 2
+        center_world_x = self.camera_x + self.player["x"]
+        center_world_y = self.camera_y + self.player["y"]
+        c.create_rectangle(
+            self.player["x"] - half_width,
+            self.player["y"] - half_height,
+            self.player["x"] + half_width,
+            self.player["y"] + half_height,
+            fill="#10111a",
                            outline="", tags="background")
-        c.create_rectangle(
-            ARENA[0] - 7, ARENA[1] - 7, ARENA[2] + 7, ARENA[3] + 7,
-            fill="#20282a", outline=border, width=3, tags="background"
-        )
-        self.rect(*ARENA, ground, border, tag="background")
-        c.create_rectangle(
-            ARENA[0] + 5, ARENA[1] + 5, ARENA[2] - 5, ARENA[3] - 5,
-            outline=grid, width=1, tag="background"
-        )
-        for x in range(ARENA[0] + 12, ARENA[2], 48):
-            c.create_line(x, ARENA[1], x, ARENA[3], fill=grid, width=1,
-                          tags="background")
-        for y in range(ARENA[1] + 12, ARENA[3], 48):
-            c.create_line(ARENA[0], y, ARENA[2], y, fill=grid, width=1,
-                          tags="background")
-        terrain_rng = random.Random(401 + self.region * 37)
-        for _ in range(13):
-            x = terrain_rng.randint(ARENA[0] + 35, ARENA[2] - 35)
-            y = terrain_rng.randint(ARENA[1] + 32, ARENA[3] - 32)
-            size = terrain_rng.randint(9, 22)
-            if self.region == 1:
-                c.create_polygon(
-                    x, y - size, x + size * 0.45, y - size * 0.15,
-                    x + size * 0.2, y + size, x - size * 0.35, y + size * 0.25,
-                    fill="#6b9aa5", outline="#9bcbd2", width=1,
-                    tags="background"
+        first_tile_x = math.floor(
+            (center_world_x - half_width) / TERRAIN_TILE_SIZE
+        ) - 1
+        last_tile_x = math.floor(
+            (center_world_x + half_width) / TERRAIN_TILE_SIZE
+        ) + 1
+        first_tile_y = math.floor(
+            (center_world_y - half_height) / TERRAIN_TILE_SIZE
+        ) - 1
+        last_tile_y = math.floor(
+            (center_world_y + half_height) / TERRAIN_TILE_SIZE
+        ) + 1
+        tile_shades = (ground, "#292a38", "#222431", "#2c2b39")
+        moss = "#253934" if self.region != 2 else "#3c303d"
+
+        for tile_y in range(first_tile_y, last_tile_y + 1):
+            for tile_x in range(first_tile_x, last_tile_x + 1):
+                seed = (
+                    tile_x * 73856093
+                    ^ tile_y * 19349663
+                    ^ self.region * 83492791
                 )
-                c.create_line(x, y - size * 0.6, x - size * 0.1, y + size * 0.3,
-                              fill="#c6eef0", width=1, tags="background")
-            elif self.region == 2:
-                c.create_oval(
-                    x - size, y - size * 0.48, x + size, y + size * 0.48,
-                    fill="#76513e", outline="#b57a4d", width=1,
-                    tags="background"
+                tile_rng = random.Random(seed)
+                x = tile_x * TERRAIN_TILE_SIZE - self.camera_x
+                y = tile_y * TERRAIN_TILE_SIZE - self.camera_y
+                inset = tile_rng.randint(2, 5)
+                c.create_rectangle(
+                    x + inset, y + inset,
+                    x + TERRAIN_TILE_SIZE - inset,
+                    y + TERRAIN_TILE_SIZE - inset,
+                    fill=tile_rng.choice(tile_shades),
+                    outline=grid, width=1, tags="background",
                 )
-                c.create_line(x - size * 0.55, y, x + size * 0.3, y - size * 0.12,
-                              fill="#d08a50", width=1, tags="background")
-            elif self.region == 3:
-                c.create_line(x, y + size, x, y - size,
-                              fill="#40583a", width=max(3, size // 3),
-                              tags="background")
-                c.create_oval(x - size, y - size * 0.9,
-                              x + size, y + size * 0.15,
-                              fill="#5f844e", outline="#87a961",
-                              width=1, tags="background")
-                c.create_oval(x - size * 0.55, y - size * 0.62,
-                              x + size * 0.25, y - size * 0.05,
-                              fill="#83a85e", outline="", tags="background")
-            else:
-                c.create_line(
-                    x - size, y + size * 0.45,
-                    x - size * 0.15, y - size * 0.35,
-                    x + size * 0.35, y - size * 0.55,
-                    fill="#6d6251", width=2, tags="background"
-                )
-                c.create_line(x - size * 0.12, y - size * 0.26,
-                              x + size * 0.75, y + size * 0.28,
-                              fill=accent, width=1, tags="background")
-        for x, y, kind, size in self.decor:
-            if kind == "crater":
-                c.create_oval(x - size, y - size * 0.45, x + size, y + size * 0.45,
-                              fill="#303a32", outline=grid, tags="background")
-            elif kind == "stone":
-                c.create_oval(x - size / 2, y - size / 3, x + size / 2, y + size / 3,
-                              fill=border, outline=ground, tags="background")
-            else:
-                c.create_line(x, y, x + size, y - size // 2, fill=accent, width=2,
-                              tags="background")
-        self.draw_barricade(ARENA[0] + 105, ARENA[1] + 55, accent, "background")
-        self.draw_barricade(ARENA[2] - 170, ARENA[3] - 68, border, "background")
-        for x, y in (
-            (ARENA[0] + 22, ARENA[1] + 22),
-            (ARENA[2] - 22, ARENA[1] + 22),
-            (ARENA[0] + 22, ARENA[3] - 22),
-            (ARENA[2] - 22, ARENA[3] - 22),
-        ):
-            c.create_oval(x - 7, y - 7, x + 7, y + 7,
-                          fill=accent, outline="#fff1d2", width=1,
-                          tags="background")
-            c.create_oval(x - 3, y - 3, x + 3, y + 3,
-                          fill="#fff1d2", outline="", tags="background")
-        self.canvas.create_line(ARENA[0] + 36, ARENA[1] + 28,
-                                ARENA[0] + 36, ARENA[1] + 66, fill="#c6c1a6", width=2,
-                                tags="background")
-        self.canvas.create_polygon(
-            ARENA[0] + 38, ARENA[1] + 29, ARENA[0] + 64, ARENA[1] + 36,
-            ARENA[0] + 38, ARENA[1] + 44, fill=accent, outline="", tags="background"
-        )
-        self.canvas.create_line(ARENA[2] - 38, ARENA[3] - 68,
-                                ARENA[2] - 38, ARENA[3] - 30, fill="#c6c1a6", width=2,
-                                tags="background")
-        self.canvas.create_polygon(
-            ARENA[2] - 36, ARENA[3] - 67, ARENA[2] - 62, ARENA[3] - 60,
-            ARENA[2] - 36, ARENA[3] - 52, fill=accent, outline="", tags="background"
-        )
+                if tile_rng.random() < 0.32:
+                    crack_x = x + tile_rng.randint(12, 46)
+                    crack_y = y + tile_rng.randint(12, 46)
+                    c.create_line(
+                        crack_x, crack_y, crack_x + 5, crack_y + 8,
+                        crack_x + 2, crack_y + 15,
+                        fill=border, width=1, tags="background",
+                    )
+                if tile_rng.random() < 0.14:
+                    moss_x = x + tile_rng.randint(7, 42)
+                    moss_y = y + tile_rng.randint(7, 42)
+                    c.create_oval(
+                        moss_x, moss_y, moss_x + 14, moss_y + 7,
+                        fill=moss, outline="", tags="background",
+                    )
+                if tile_rng.random() < 0.025:
+                    rune_x = x + tile_rng.randint(15, 42)
+                    rune_y = y + tile_rng.randint(15, 42)
+                    c.create_oval(
+                        rune_x - 5, rune_y - 5, rune_x + 5, rune_y + 5,
+                        outline=accent, width=1, tags="background",
+                    )
+                    c.create_oval(
+                        rune_x - 2, rune_y - 2, rune_x + 2, rune_y + 2,
+                        fill=accent, outline="", tags="background",
+                    )
+        if self.view_scale_x != 1 or self.view_scale_y != 1:
+            self.canvas.scale(
+                "background", 0, 0, self.view_scale_x, self.view_scale_y
+            )
+        if self.battlefield_zoom != 1:
+            self.canvas.scale(
+                "background",
+                self.player["x"] * self.view_scale_x,
+                self.player["y"] * self.view_scale_y,
+                self.battlefield_zoom,
+                self.battlefield_zoom,
+            )
 
     def draw_barricade(self, x, y, color, tag="frame"):
         c = self.canvas
@@ -3554,6 +4187,17 @@ class BattlefieldRPG:
         self.rect(x, y, x + width, y + height, "#252a29")
         if ratio > 0:
             self.rect(x, y, x + width * max(0, min(1, ratio)), y + height, color)
+
+    def draw_health_hearts(self, x, y):
+        health_ratio = max(0, min(1, self.player["hp"] / self.player["max_hp"]))
+        filled_hearts = math.ceil(health_ratio * 10)
+        for index in range(10):
+            self.canvas.create_text(
+                x + index * 19, y,
+                text="♥",
+                fill="#f35f80" if index < filled_hearts else "#55404f",
+                font=("Segoe UI", 15, "bold"), tags="frame",
+            )
 
     def draw_entity(self, x, y, radius, body, outline, direction=(1, 0),
                     kind="raider", cosmetic_override=None, moving=False):
@@ -3727,10 +4371,137 @@ class BattlefieldRPG:
                     fill=glove_color, outline="#292c29", width=1, tags="frame"
                 )
 
+    def draw_mythical_beast(self, enemy, color, direction):
+        x, y, radius = enemy["x"], enemy["y"], enemy["radius"]
+        form = enemy.get("mythic_form", enemy.get("form", ""))
+        fx, fy = direction
+        length = max(1, math.hypot(fx, fy))
+        fx, fy = fx / length, fy / length
+        side_x, side_y = -fy, fx
+
+        def point(forward, sideways):
+            return (
+                x + fx * radius * forward + side_x * radius * sideways,
+                y + fy * radius * forward + side_y * radius * sideways,
+            )
+
+        c = self.canvas
+        c.create_oval(x - radius * 1.15, y - radius * 0.62,
+                      x + radius * 1.15, y + radius * 0.72,
+                      fill="#252127", outline="", tags="frame")
+        for side in (-0.72, 0.72):
+            leg_start = point(-0.2, side)
+            leg_end = point(-0.5, side * 0.85)
+            c.create_line(*leg_start, *leg_end, fill="#332b30",
+                          width=max(4, int(radius * 0.22)), tags="frame")
+        c.create_oval(x - radius * 0.82, y - radius * 0.56,
+                      x + radius * 0.54, y + radius * 0.5,
+                      fill=color, outline="#e5c874", width=3, tags="frame")
+        head = point(0.78, 0)
+        head_radius = radius * (0.32 if form not in ("fire_yeti", "ice_yeti") else 0.4)
+        c.create_oval(head[0] - head_radius, head[1] - head_radius,
+                      head[0] + head_radius, head[1] + head_radius,
+                      fill=color, outline="#e5c874", width=3, tags="frame")
+        snout = point(1.05, 0)
+        c.create_polygon(
+            *point(0.68, -0.18), *point(1.22, -0.1),
+            *point(1.24, 0.12), *point(0.68, 0.18),
+            fill="#3b2931", outline="#e5c874", width=2, tags="frame"
+        )
+        c.create_oval(
+            snout[0] - radius * 0.05, snout[1] - radius * 0.05,
+            snout[0] + radius * 0.05, snout[1] + radius * 0.05,
+            fill="#ffd66b", outline="", tags="frame"
+        )
+        tail_start, tail_end = point(-0.78, 0), point(-1.3, 0.15)
+        c.create_line(*tail_start, *tail_end, fill=color,
+                      width=max(4, int(radius * 0.16)), smooth=True, tags="frame")
+        if form in ("griffin", "chimera"):
+            for side in (-1, 1):
+                c.create_polygon(
+                    *point(0.15, side * 0.55),
+                    *point(-0.3, side * 1.45),
+                    *point(-0.55, side * 0.65),
+                    fill="#d2bd91", outline="#f4e3c9", width=2, tags="frame"
+                )
+        if form in ("cerberus", "hydra"):
+            for side in (-0.34, 0.34):
+                extra_head = point(0.72, side)
+                c.create_oval(
+                    extra_head[0] - head_radius * 0.72,
+                    extra_head[1] - head_radius * 0.72,
+                    extra_head[0] + head_radius * 0.72,
+                    extra_head[1] + head_radius * 0.72,
+                    fill=color, outline="#e5c874", width=2, tags="frame"
+                )
+        if form in ("chimera", "wolf", "griffin", "fire_yeti", "ice_yeti"):
+            for side in (-0.22, 0.22):
+                horn_start = point(0.8, side)
+                horn_tip = point(1.12, side * 1.5)
+                c.create_line(*horn_start, *horn_tip, fill="#f3d9a1",
+                              width=max(3, int(radius * 0.1)), tags="frame")
+        if form == "staff_demon":
+            staff_top = point(0.15, -1.05)
+            staff_bottom = point(-0.55, -1.05)
+            c.create_line(*staff_top, *staff_bottom, fill="#261b2d",
+                          width=max(4, int(radius * 0.12)), tags="frame")
+            c.create_oval(staff_top[0] - radius * 0.12,
+                          staff_top[1] - radius * 0.12,
+                          staff_top[0] + radius * 0.12,
+                          staff_top[1] + radius * 0.12,
+                          fill="#e24f93", outline="#f2d5a5",
+                          width=2, tags="frame")
+        if form in ("fire_yeti", "ice_yeti"):
+            breath_color = "#ff7548" if form == "fire_yeti" else "#8ee5f0"
+            for index in range(3):
+                spark = point(1.35 + index * 0.16, (index - 1) * 0.14)
+                c.create_oval(spark[0] - radius * 0.08,
+                              spark[1] - radius * 0.08,
+                              spark[0] + radius * 0.08,
+                              spark[1] + radius * 0.08,
+                              fill=breath_color, outline="#fff1d2", tags="frame")
+
+    def draw_demon_enemy_overlay(self, enemy):
+        c = self.canvas
+        x, y, radius = enemy["x"], enemy["y"], enemy["radius"]
+        kind = enemy["kind"]
+        if kind == "winged_demon":
+            c.create_polygon(
+                x - radius * 0.3, y, x - radius * 1.5, y - radius,
+                x - radius * 1.1, y + radius * 0.5,
+                x, y + radius * 0.35,
+                fill="#4a2d50", outline="#d28ad7", width=2, tags="frame"
+            )
+            c.create_polygon(
+                x + radius * 0.3, y, x + radius * 1.5, y - radius,
+                x + radius * 1.1, y + radius * 0.5,
+                x, y + radius * 0.35,
+                fill="#4a2d50", outline="#d28ad7", width=2, tags="frame"
+            )
+        elif kind == "horned_demon":
+            for side in (-1, 1):
+                c.create_line(
+                    x + side * radius * 0.25, y - radius * 0.45,
+                    x + side * radius * 0.72, y - radius * 1.25,
+                    fill="#e7c68b", width=4, tags="frame"
+                )
+        elif kind in ("gravity_mage", "staff_demon"):
+            color = "#c96bf2" if kind == "gravity_mage" else "#e5548f"
+            c.create_line(x + radius * 0.7, y - radius * 0.5,
+                          x + radius * 1.15, y + radius * 0.8,
+                          fill="#342139", width=5, tags="frame")
+            c.create_oval(x + radius * 0.82, y - radius * 0.72,
+                          x + radius * 1.12, y - radius * 0.42,
+                          fill=color, outline="#fff1d2", width=2, tags="frame")
+            if kind == "gravity_mage":
+                c.create_oval(x - radius * 1.1, y - radius * 1.1,
+                              x + radius * 1.1, y + radius * 1.1,
+                              outline=color, width=2, dash=(3, 4), tags="frame")
+
     def draw_floor_progression(self):
         c = self.canvas
         c.create_rectangle(0, 0, WIDTH, HEIGHT, fill="#101718", tags="frame")
-        c.create_text(WIDTH / 2, 34, text="THE 200-FLOOR SPIRAL",
+        c.create_text(WIDTH / 2, 34, text="THE 150-FLOOR SPIRAL",
                       fill="#f0d7c5", font=("Segoe UI", 25, "bold"), tags="frame")
         c.create_text(WIDTH / 2, 70,
                       text=f"CURRENT FLOOR {self.stage_number()} / {MAX_FLOORS}",
@@ -4564,19 +5335,24 @@ class BattlefieldRPG:
 
     def draw_game(self, now):
         p = self.player
-        self.rect(0, 0, WIDTH, 80, "#20292b")
+        self.rect(0, 0, WIDTH, 80, "#191822", "#51445d")
         self.canvas.create_text(24, 19, text="ASHEN FRONT", anchor="w",
                                 fill="#e6d9ba", font=("Segoe UI", 13, "bold"), tags="frame")
         self.canvas.create_text(24, 48,
                                 text=f"LV {p['level']}  |  FLOOR {self.stage_number()}/{MAX_FLOORS}  |  WAVE {self.floor_wave}/{self.floor_wave_count()}",
                                 anchor="w", fill="#c6c5b4", font=("Segoe UI", 10, "bold"),
                                 tags="frame")
-        self.draw_bar(180, 20, 200, p["hp"] / p["max_hp"], "#c4584e", 13)
-        self.canvas.create_text(180, 43, text=f"HP  {p['hp']} / {p['max_hp']}",
-                                anchor="w", fill="#e7d8c8", font=("Segoe UI", 9), tags="frame")
+        self.canvas.create_text(180, 14, text="VITALITY",
+                                anchor="w", fill="#d9c9dc",
+                                font=("Segoe UI", 8, "bold"), tags="frame")
+        self.draw_health_hearts(187, 39)
+        self.canvas.create_text(376, 39, text=f"{p['hp']} / {p['max_hp']} HP",
+                                anchor="w", fill="#f0d7e3",
+                                font=("Segoe UI", 9, "bold"), tags="frame")
         self.draw_bar(180, 57, 200, p["xp"] / p["next_xp"], "#d2a64e", 7)
-        self.canvas.create_text(408, 23, text=f"XP  {p['xp']} / {p['next_xp']}",
-                                anchor="w", fill="#d8c58f", font=("Segoe UI", 9), tags="frame")
+        self.canvas.create_text(24, 68, text=f"XP  {p['xp']} / {p['next_xp']}",
+                                anchor="w", fill="#d8c58f",
+                                font=("Segoe UI", 8, "bold"), tags="frame")
         self.canvas.create_text(WIDTH - 24, 24, text=f"DEFEATED  {self.kills}",
                                 anchor="e", fill="#c6c5b4", font=("Segoe UI", 10, "bold"),
                                 tags="frame")
@@ -4599,9 +5375,11 @@ class BattlefieldRPG:
             region_status = f"ASCENDED  -  LEVEL 100  |  {region_status}"
         elif len(self.skill_copies) >= 7:
             region_status += "  |  SUPERHUMAN READY  -  PRESS T"
+        style_name, _ = self.floor_fight_style()
+        region_status += f"  |  {style_name}"
         self.canvas.create_text(WIDTH / 2, 68,
                                 text=region_status,
-                                fill="#d0d4c2", font=("Segoe UI", 8, "bold"), tags="frame")
+                                fill="#dfc5e8", font=("Segoe UI", 8, "bold"), tags="frame")
         if self.equipped_abilities:
             skill_labels = []
             for index, skill in enumerate(self.equipped_abilities):
@@ -4637,6 +5415,8 @@ class BattlefieldRPG:
                 font=("Segoe UI", 8, "bold"), tags="frame"
             )
 
+        world_items_after = self.canvas.find_all()
+        world_start = world_items_after[-1] if world_items_after else 0
         for pickup in self.pickups:
             x, y = pickup["x"], pickup["y"]
             if pickup["kind"] == "medkit":
@@ -4678,26 +5458,54 @@ class BattlefieldRPG:
                 "raider": "#bd6555", "ranger": "#ce9c51", "brute": "#875b72",
                 "boss": "#a44951", "minion_boss": "#75517c",
                 "kidnapper": "#3e263f", "kidnapper_clone": "#8f739b",
+                "final_demon": "#4c1f3b", "fire_yeti": "#a84536",
+                "ice_yeti": "#558ca5", "winged_demon": "#713d78",
+                "horned_demon": "#954b4c", "gravity_mage": "#6b46a0",
+                "staff_demon": "#512c4e",
             }[enemy["kind"]]
             if now < enemy["hurt_until"]:
                 color = "#f4e3c9"
             facing = (p["x"] - enemy["x"], p["y"] - enemy["y"])
             facing_length = max(1, math.hypot(*facing))
             facing = (facing[0] / facing_length, facing[1] / facing_length)
-            self.draw_entity(
-                enemy["x"], enemy["y"], enemy["radius"], color, "#352c2b",
-                facing, enemy["kind"],
-                moving=(math.hypot(p["x"] - enemy["x"], p["y"] - enemy["y"])
-                        > enemy["radius"] + 20)
-            )
-            if enemy["kind"] in ("boss", "minion_boss", "kidnapper"):
+            if enemy["kind"] in (
+                    "minion_boss", "final_demon", "fire_yeti", "ice_yeti"):
+                self.draw_mythical_beast(enemy, color, facing)
+            else:
+                self.draw_entity(
+                    enemy["x"], enemy["y"], enemy["radius"], color, "#352c2b",
+                    facing, enemy["kind"],
+                    moving=(math.hypot(p["x"] - enemy["x"], p["y"] - enemy["y"])
+                            > enemy["radius"] + 20)
+                )
+                if enemy["kind"] in DEMON_ENEMY_KINDS:
+                    self.draw_demon_enemy_overlay(enemy)
+            if enemy["kind"] in (
+                    "boss", "minion_boss", "kidnapper", "final_demon",
+                    "fire_yeti", "ice_yeti"):
+                boss_group = [
+                    member for member in self.enemies
+                    if member["kind"] in ("final_demon", "fire_yeti", "ice_yeti")
+                ]
+                boss_index = boss_group.index(enemy) if enemy in boss_group else 0
+                bar_y = 101 + boss_index * 16
                 boss_bar_x = WIDTH / 2 - 150
-                self.draw_bar(boss_bar_x, 104, 300, enemy["hp"] / enemy["max_hp"],
-                              "#c3424a", 10)
-                self.canvas.create_text(WIDTH / 2, 91,
-                                        text=f'{enemy["boss_name"]}  {enemy["hp"]} HP',
-                                        fill="#f0d7c5", font=("Segoe UI", 10, "bold"),
-                                        tags="frame")
+                self.canvas.create_rectangle(
+                    boss_bar_x, bar_y, boss_bar_x + 300, bar_y + 9,
+                    fill="#252a29", outline="", tags=("frame", "hud")
+                )
+                self.canvas.create_rectangle(
+                    boss_bar_x, bar_y,
+                    boss_bar_x + 300 * max(0, min(1, enemy["hp"] / enemy["max_hp"])),
+                    bar_y + 9, fill="#c3424a", outline="",
+                    tags=("frame", "hud")
+                )
+                self.canvas.create_text(
+                    WIDTH / 2, bar_y - 4,
+                    text=f'{enemy["boss_name"]}  {enemy["hp"]} HP',
+                    fill="#f0d7c5", font=("Segoe UI", 8, "bold"),
+                    tags=("frame", "hud")
+                )
                 if enemy["special_until"] > 0 and enemy["special_line"]:
                     x1, y1, x2, y2 = enemy["special_line"]
                     skill_name = (enemy.get("skill") or ("",))[0]
@@ -4733,6 +5541,17 @@ class BattlefieldRPG:
             else:
                 self.draw_bar(enemy["x"] - 16, enemy["y"] - enemy["radius"] - 11, 32,
                               enemy["hp"] / enemy["max_hp"], "#d57462", 4)
+
+        if self.shadow_ally is not None:
+            ally = self.shadow_ally
+            self.canvas.create_oval(
+                ally["x"] - ally["radius"] * 1.4,
+                ally["y"] - ally["radius"] * 1.1,
+                ally["x"] + ally["radius"] * 1.4,
+                ally["y"] + ally["radius"] * 1.1,
+                outline="#c478f1", width=2, dash=(4, 3), tags="frame"
+            )
+            self.draw_mythical_beast(ally, "#553c70", (1, 0))
 
         player_becomes_titan = any(
             effect["kind"] == "epic_fall"
@@ -4774,10 +5593,23 @@ class BattlefieldRPG:
                     tags="frame"
                 )
         for projectile in self.projectiles:
-            fill = "#ff824a" if projectile.get("kind") == "ember" else "#ffe28a"
-            self.canvas.create_oval(projectile["x"] - 4, projectile["y"] - 4,
-                                    projectile["x"] + 4, projectile["y"] + 4,
-                                    fill=fill, outline="#fff7d1", tags="frame")
+            kind = projectile.get("kind")
+            fill = {
+                "enemy_bolt": "#e98cff", "gravity_orb": "#bd71ff",
+                "staff_orb": "#ed4e92", "wind_bolt": "#d9efff",
+                "venom_orb": "#7bdd72", "fire_breath": "#ff824a",
+                "ice_breath": "#8ee5f0", "spike_bolt": "#cfbd92",
+                "ember": "#ff824a",
+            }.get(kind, "#ffe28a")
+            radius = 7 if kind in (
+                "enemy_bolt", "gravity_orb", "staff_orb", "fire_breath",
+                "ice_breath",
+            ) else 4
+            self.canvas.create_oval(
+                projectile["x"] - radius, projectile["y"] - radius,
+                projectile["x"] + radius, projectile["y"] + radius,
+                fill=fill, outline="#fff7d1", tags="frame"
+            )
         for effect in self.effects:
             if effect["kind"] == "laser":
                 x1, y1, x2, y2 = effect["line"]
@@ -4945,12 +5777,39 @@ class BattlefieldRPG:
                                     p["x"] + fx * 37, p["y"] + fy * 37,
                                     fill="#fff1b0", width=4, tags="frame")
 
+        for item in self.canvas.find_all():
+            if item <= world_start:
+                continue
+            tags = self.canvas.gettags(item)
+            if "frame" in tags and "hud" not in tags:
+                self.canvas.dtag(item, "frame")
+                self.canvas.addtag_withtag("world", item)
+        if self.battlefield_zoom != 1:
+            self.canvas.scale(
+                "world", p["x"], p["y"], self.battlefield_zoom,
+                self.battlefield_zoom,
+            )
+        if self.rescue_completed:
+            self.draw_pixel_mentor(
+                ARENA[0] + 30, ARENA[1] + 104, angel=True
+            )
+        else:
+            self.draw_pixel_mentor(
+                ARENA[0] + 30, ARENA[1] + 104, angel=False, blurred=True
+            )
+        if self.mentor_text and now < self.mentor_until:
+            self.canvas.create_text(
+                ARENA[0] + 18, ARENA[1] + 145, text=self.mentor_text,
+                anchor="w", width=245, fill="#e2c98e",
+                font=("Segoe UI", 8, "bold"), tags="frame"
+            )
+
         if now < self.message_until:
             self.canvas.create_text(WIDTH / 2, 128, text=self.message,
                                     fill="#f0d99f", font=("Segoe UI", 12, "bold"),
                                     tags="frame")
         self.canvas.create_text(WIDTH / 2, HEIGHT - 22,
-                                text="MOVE: WASD   SHOOT: SPACE/CLICK   SKILLS: 1-5   AIM: RIGHT-CLICK   E: INTERACT   `: LOADOUT   Q: QUEST/WEAPONS",
+                                text="MOVE: WASD   SHOOT: SPACE/CLICK   SKILLS: 1-5   AIM: RIGHT-CLICK   ZOOM: WHEEL / +/-   Q: SHADOW",
                                 fill="#b9c1ac", font=("Segoe UI", 9, "bold"), tags="frame")
         self.draw_skill_dialogue()
         if self.active_quest:
@@ -5350,12 +6209,11 @@ class BattlefieldRPG:
         if elapsed < 6.6:
             dialogue = "WELCOME TO MY WORLD OF DEATH AND DESIRE!"
         elif elapsed < 9:
-            dialogue = ("YOU HAVE TO MAKE YOUR WAY FROM THE 1ST STAGE TO THE "
-                        "200TH FLOOR, WHERE MY MINION WILL FIGHT YOU WITH "
-                        "50% OF MY ORIGINAL POWERS...")
+            dialogue = ("DEFEAT FIVE MYTHIC MINIONS AND GATHER THEIR CLUES. "
+                        "THEY WILL LEAD YOU TO MY RESCUE...")
         elif elapsed < 10.8:
-            dialogue = ("THEN, AFTER CLIMBING ALL 200 FLOORS, FIND AND DEFEAT ME "
-                        "TO BECOME THE TOWER KING...")
+            dialogue = ("BECOME SUPERHUMAN, RESCUE ME, THEN FACE THE DEMON OF "
+                        "DEATH AND DESIRE AND TWO YETIS ON FLOOR 150...")
         else:
             dialogue = "HELP!!"
         if elapsed >= 4:
@@ -5489,6 +6347,81 @@ class BattlefieldRPG:
             + (f"  -  {remaining:.1f}" if remaining else ""),
             fill="#c2c7b9", font=("Segoe UI", 9, "bold"), tags="frame"
         )
+        self.draw_pixel_mentor(110, 375, angel=False, blurred=True)
+        if self.mentor_text:
+            self.canvas.create_text(
+                355, 390, text=self.mentor_text, width=520,
+                fill="#e5c874", font=("Segoe UI", 12, "bold"), tags="frame"
+            )
+
+    def draw_pixel_mentor(self, x, y, angel=False, blurred=False):
+        c = self.canvas
+        aura = "#d8c1f0" if angel else "#855b9b"
+        robe = "#f3ead4" if angel else "#493b52"
+        wing = "#fff4d0" if angel else "#554762"
+        outline = "#f1d59d" if angel else "#9b75ad"
+        c.create_oval(
+            x - 34, y - 45, x + 34, y + 42,
+            fill=aura, stipple="gray50" if blurred else "",
+            outline="", tags="frame"
+        )
+        c.create_polygon(
+            x - 10, y - 5, x - 48, y - 28, x - 36, y + 12,
+            x - 12, y + 8, fill=wing, outline=outline, width=2, tags="frame"
+        )
+        c.create_polygon(
+            x + 10, y - 5, x + 48, y - 28, x + 36, y + 12,
+            x + 12, y + 8, fill=wing, outline=outline, width=2, tags="frame"
+        )
+        c.create_rectangle(
+            x - 13, y - 4, x + 13, y + 30,
+            fill=robe, outline=outline, width=2, tags="frame"
+        )
+        c.create_oval(
+            x - 10, y - 28, x + 10, y - 8,
+            fill="#f1d5bc" if angel else "#75657d",
+            outline=outline, width=2, tags="frame"
+        )
+        if angel:
+            c.create_oval(
+                x - 17, y - 43, x + 17, y - 32,
+                outline="#ffe785", width=3, tags="frame"
+            )
+            for side in (-1, 1):
+                c.create_rectangle(
+                    x + side * 24, y - 15, x + side * 33, y - 8,
+                    fill="#fff1c1", outline="", tags="frame"
+                )
+
+    def draw_angel_guide(self, now):
+        self.canvas.create_rectangle(
+            0, 0, WIDTH, HEIGHT, fill="#13131c",
+            stipple="gray50", outline="", tags="frame"
+        )
+        self.draw_pixel_mentor(WIDTH / 2 - 210, 315, angel=True)
+        self.canvas.create_text(
+            WIDTH / 2 + 120, 185, text="THE PIXEL GOD AWAKENS",
+            fill="#f1d59d", font=("Segoe UI", 25, "bold"), tags="frame"
+        )
+        self.canvas.create_text(
+            WIDTH / 2 + 120, 252,
+            text='"The Demon King is safe. I am your angel guide now. '
+                 'Fifty demon floors remain; the wings, horns, gravity magic, '
+                 'and Death-and-Desire staff await."',
+            width=510, fill="#f3ead4", font=("Segoe UI", 15, "bold"),
+            tags="frame"
+        )
+        floor = self.stage_number()
+        self.canvas.create_text(
+            WIDTH / 2 + 120, 360,
+            text=f"YOUR NEXT FLOOR: {floor}  |  CAMPAIGN ENDS AT FLOOR {MAX_FLOORS}",
+            fill="#e5c874", font=("Segoe UI", 12, "bold"), tags="frame"
+        )
+        remaining = max(0, self.angel_guide_until - now)
+        self.canvas.create_text(
+            WIDTH / 2 + 120, 420, text=f"THE ANGEL WILL GUIDE YOU  {remaining:.1f}",
+            fill="#d0d4c2", font=("Segoe UI", 10, "bold"), tags="frame"
+        )
 
     def draw_kidnapper_reveal(self, now):
         elapsed = 6 - max(0, self.kidnapper_reveal_until - now)
@@ -5597,7 +6530,7 @@ class BattlefieldRPG:
                                      fill="#18201f", outline="#d4bd91",
                                      width=2, tags="frame")
         self.canvas.create_text(WIDTH / 2, 530,
-                                text=f"COINS: {self.coins}   |   COLLECT THE BOSS'S COINS BEFORE YOU GO",
+                                text=f"COINS: {self.coins}   |   COLLECT FLOOR COINS BEFORE YOU GO",
                                 fill="#e5c874", font=("Segoe UI", 11, "bold"),
                                 tags="frame")
         if remaining <= 0:
@@ -5608,12 +6541,13 @@ class BattlefieldRPG:
                                 text=stage_text,
                                 fill="#d8c58f", font=("Segoe UI", 10, "bold"),
                                 tags="frame")
-        if self.rescue_route_unlocked:
+        rescue_pending = self.rescue_route_unlocked and not self.rescue_completed
+        if rescue_pending:
             buttons = (
                 (80, 560, 260, 600, "SHOP  B"),
                 (270, 560, 450, 600, "TERRAIN  M"),
-                (470, 560, 670, 600, "RESCUE ROUTE"),
-                (690, 560, 880, 600, "KEEP CLIMBING"),
+                (470, 560, 670, 600, "FOLLOW MENTOR: RESCUE"),
+                (690, 560, 880, 600, "RESCUE REQUIRED"),
             )
         else:
             buttons = (
@@ -5621,13 +6555,17 @@ class BattlefieldRPG:
                 (320, 560, 520, 600, "TERRAIN  M"),
                 (650, 560, 850, 600, "NEXT FLOOR"),
             )
-        if self.rescue_route_unlocked:
+        if rescue_pending:
             clue_status = f"FIVE CLUES FOUND  |  {len(self.tower_clues)}/{len(TOWER_MINIONS)}"
             self.canvas.create_text(WIDTH / 2, 545, text=clue_status,
                                     fill="#e5c874", font=("Segoe UI", 9, "bold"),
                                     tags="frame")
         for x1, y1, x2, y2, label in buttons:
-            enabled = label not in ("NEXT FLOOR", "KEEP CLIMBING") or remaining <= 0
+            enabled = (
+                label != "RESCUE REQUIRED"
+                and (label not in ("NEXT FLOOR", "KEEP CLIMBING")
+                     or remaining <= 0)
+            )
             fill = "#53634d" if enabled else "#343b38"
             self.canvas.create_rectangle(x1, y1, x2, y2, fill=fill,
                                          outline="#d4bd91", width=1, tags="frame")
@@ -6055,7 +6993,7 @@ class BattlefieldRPG:
         )
         self.canvas.create_text(
             WIDTH / 2, 565,
-            text="AUTO-SAVES EVERY 10 SECONDS  |  CTRL+SHIFT+S SAVES NOW",
+            text="F11 FULLSCREEN  |  AUTO-SAVES EVERY 10 SECONDS  |  CTRL+SHIFT+S SAVES NOW",
             fill="#9ea99d", font=("Segoe UI", 9, "bold"), tags="frame"
         )
         if time.monotonic() < self.save_notice_until:
@@ -6067,7 +7005,7 @@ class BattlefieldRPG:
         now = time.monotonic()
         dt = min(now - self.last_tick, 0.05)
         self.last_tick = now
-        self.canvas.delete("frame")
+        self.canvas.delete("frame", "world")
         self.show_next_side_quest_popup()
         self.update_flow(now)
         if self.state == "tower_gate":
@@ -6081,7 +7019,7 @@ class BattlefieldRPG:
                           "auto_aim_prompt"):
             self.draw_game(now)
         else:
-            self.canvas.delete("frame")
+            self.canvas.delete("frame", "world")
         if self.state == "menu":
             self.draw_main_menu()
         elif self.state == "tower_exterior":
@@ -6109,6 +7047,8 @@ class BattlefieldRPG:
             self.draw_minion_reveal(now)
         elif self.state == "kidnapper_reveal":
             self.draw_kidnapper_reveal(now)
+        elif self.state == "angel_guide":
+            self.draw_angel_guide(now)
         elif self.state == "shop":
             self.draw_shop()
         elif self.state == "region_map":
@@ -6150,6 +7090,9 @@ class BattlefieldRPG:
         elif self.state == "victory":
             self.draw_victory()
         self.draw_side_quest_completion_popup(now)
+        if self.view_scale_x != 1 or self.view_scale_y != 1:
+            self.canvas.scale("frame", 0, 0, self.view_scale_x, self.view_scale_y)
+            self.canvas.scale("world", 0, 0, self.view_scale_x, self.view_scale_y)
         self.root.after(33, self.tick)
 
 

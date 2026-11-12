@@ -1,7 +1,7 @@
 {
   "version": 1,
-  "floor": 4,
-  "floor_wave": 1,
+  "floor": 5,
+  "floor_wave": 4,
   "floor_records": {
     "1": {
       "cleared": true,
@@ -41,33 +41,59 @@
       "kills": 43,
       "level": 11,
       "coins": 1412
+    },
+    "4": {
+      "cleared": true,
+      "quest_index": 2,
+      "quest_title": "SWEEP THE FLOOR",
+      "quest_complete": true,
+      "stars": 3,
+      "quest_progress": 12,
+      "quest_target": 12,
+      "quest_reward": 137,
+      "kills": 49,
+      "level": 12,
+      "coins": 12681
+    },
+    "5": {
+      "cleared": true,
+      "quest_index": 2,
+      "quest_title": "SWEEP THE FLOOR",
+      "quest_complete": true,
+      "stars": 3,
+      "quest_progress": 12,
+      "quest_target": 12,
+      "quest_reward": 171,
+      "kills": 70,
+      "level": 13,
+      "coins": 12995
     }
   },
   "owned_special_weapons": [],
   "equipped_special_weapon": null,
   "special_shots_left": 3,
-  "floor_kills_start": 121,
+  "floor_kills_start": 170,
   "active_quest_index": 2,
-  "quest_progress": 0,
-  "quest_complete": false,
-  "encounter_clear": false,
+  "quest_progress": 12,
+  "quest_complete": true,
+  "encounter_clear": true,
   "minion_difficulty": null,
   "replay_active": false,
   "replay_return_snapshot": null,
   "progression_return_state": "post_boss",
   "player": {
-    "level": 12,
-    "xp": 1283,
-    "next_xp": 2338,
-    "speed": 223,
-    "max_hp": 276,
-    "hp": 276
+    "level": 14,
+    "xp": 2113,
+    "next_xp": 4915,
+    "speed": 229,
+    "max_hp": 308,
+    "hp": 308
   },
-  "coins": 1527,
-  "gems": 11,
+  "coins": 13126,
+  "gems": 0,
   "side_quest_stats": {
     "weapons_purchased": 0,
-    "skills_obtained": 3,
+    "skills_obtained": 5,
     "skills_forged": 0,
     "superhuman": 0
   },
@@ -75,7 +101,12 @@
     "obtain_skill_1",
     "obtain_skill_3"
   ],
-  "kills": 121,
+  "side_quests_notified": [
+    "obtain_skill_1",
+    "obtain_skill_3"
+  ],
+  "side_quest_popup_queue": [],
+  "kills": 240,
   "region": 0,
   "territories": [
     true,
@@ -112,6 +143,16 @@
       "Groundsplit",
       "Earth, answer me! Groundsplit!",
       "You have earned my Groundsplit. Make it count."
+    ],
+    [
+      "Time Freeze",
+      "Time, stand still! Time Freeze!",
+      "Time bends to my will. Use the pause to strike."
+    ],
+    [
+      "Time Freeze",
+      "Time, stand still! Time Freeze!",
+      "Time bends to my will. Use the pause to strike."
     ],
     [
       "Time Freeze",
@@ -164,7 +205,9 @@
   "quests_completed": [
     1,
     2,
-    3
+    3,
+    4,
+    5
   ],
   "tower_clues": [],
   "rescue_route_unlocked": false
