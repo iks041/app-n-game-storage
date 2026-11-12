@@ -75,6 +75,8 @@ SIDE_QUESTS = (
     ("obtain_skill_7", "Obtain 7 skills", "skills_obtained", 7, 18),
     ("forge_skill_10", "Forge 10 skills", "skills_forged", 10, 20),
 )
+MARKET_GEM_PRICE_TIERS = ((5_000, 5), (8_000, 7), (11_000, 10))
+COINS_PER_GEM = 1_000
 SKILL_DAMAGE_RANGE = {
     "Groundsplit": (130, 320),
     "Frost Nova": (85, 235),
@@ -418,6 +420,14 @@ class BattlefieldRPG:
         self.quick_loadout_open = False
         self.quick_loadout_page = 0
         self.side_quests_return_state = "marketplace"
+        self.quest_weapons_return_state = "menu"
+        self.quest_weapons_tab = "quests"
+        self.pending_side_quest_claim = None
+        self.side_quest_popup_queue = []
+        self.side_quests_notified = set()
+        self.side_quest_popup_until = 0
+        self.side_quest_popup_title = ""
+        self.coin_gems_return_state = "character"
         self.last_autosave_at = time.monotonic()
         self.kills = 0
         self.floor_kills_start = 0
@@ -484,7 +494,7 @@ class BattlefieldRPG:
 
     def regular_waves_per_floor(self, floor=None):
         floor = self.stage_number() if floor is None else floor
-        return 3 + 2 * ((floor - 1) // 5)
+        return 3 + ((floor - 1) // 5)
 
     def is_minion_boss_wave(self):
         return (
@@ -644,10 +654,6 @@ class BattlefieldRPG:
         if save:
             self.save_game()
 
-    @staticmethod
-    def gem_price(coin_price):
-        return max(1, math.ceil(coin_price / 1_000))
-
     def track_side_quest_progress(self, counter, amount=1):
         if counter not in self.side_quest_stats or amount <= 0:
             return
@@ -655,24 +661,137 @@ class BattlefieldRPG:
         self.award_side_quests()
 
     def award_side_quests(self, save=True):
-        newly_awarded = []
-        for quest_id, title, counter, target, reward in SIDE_QUESTS:
-            if (quest_id not in self.side_quests_claimed
-                    and self.side_quest_stats[counter] >= target):
-                self.side_quests_claimed.add(quest_id)
-                self.gems += reward
-                newly_awarded.append((title, reward))
-        if newly_awarded:
-            reward_total = sum(reward for _, reward in newly_awarded)
-            self.message = f"SIDE QUEST COMPLETE  +{reward_total} GEMS"
-            self.message_until = time.monotonic() + 3
+        newly_completed = []
+        for quest_id, title, counter, target, _reward in SIDE_QUESTS:
+            if (self.side_quest_stats[counter] >= target
+                    and quest_id not in self.side_quests_notified):
+                self.side_quests_notified.add(quest_id)
+                newly_completed.append((quest_id, title))
+        if newly_completed:
+            self.side_quest_popup_queue.extend(newly_completed)
+            self.show_next_side_quest_popup()
             if save:
                 self.save_game()
+
+    def show_next_side_quest_popup(self):
+        if self.side_quest_popup_queue and time.monotonic() >= self.side_quest_popup_until:
+            _quest_id, title = self.side_quest_popup_queue.pop(0)
+            self.side_quest_popup_title = title
+            self.side_quest_popup_until = time.monotonic() + 4
+        elif time.monotonic() >= self.side_quest_popup_until:
+            self.side_quest_popup_title = ""
 
     def open_side_quests(self, return_state):
         self.quick_loadout_open = False
         self.side_quests_return_state = return_state
         self.state = "side_quests"
+
+    def open_quest_weapons(self, return_state):
+        self.quick_loadout_open = False
+        self.quest_weapons_return_state = return_state
+        self.quest_weapons_tab = "quests"
+        self.state = "quest_weapons"
+
+    def open_coin_gems(self, return_state="character"):
+        self.coin_gems_return_state = return_state
+        self.state = "coin_gems"
+
+    @staticmethod
+    def gem_price(coin_price):
+        for maximum_price, gem_cost in MARKET_GEM_PRICE_TIERS:
+            if coin_price <= maximum_price:
+                return gem_cost
+        return 15
+
+    def handle_coin_gems_click(self, x, y):
+        if y >= 555 and x <= 260:
+            self.state = self.coin_gems_return_state
+            return
+        if not (170 <= y <= 410
+                and (90 <= x <= 465 or 495 <= x <= 870)):
+            return
+        row = (y - 170) // 80
+        amount = (1, 5, 10)[row] if 0 <= row < 3 else None
+        if amount is None:
+            return
+        if x < WIDTH / 2:
+            coin_cost = amount * COINS_PER_GEM
+            if self.coins < coin_cost:
+                self.message = f"NOT ENOUGH COINS  -  NEED {coin_cost:,}"
+                self.message_until = time.monotonic() + 2
+                return
+            self.coins -= coin_cost
+            self.gems += amount
+            self.message = f"EXCHANGED {coin_cost:,} COINS FOR {amount} GEMS"
+        else:
+            if self.gems < amount:
+                self.message = f"NOT ENOUGH GEMS  -  NEED {amount}"
+                self.message_until = time.monotonic() + 2
+                return
+            self.gems -= amount
+            self.coins += amount * COINS_PER_GEM
+            self.message = f"EXCHANGED {amount} GEMS FOR {amount * COINS_PER_GEM:,} COINS"
+        self.message_until = time.monotonic() + 2
+        self.save_game()
+
+    def claim_side_quest(self, quest_id):
+        quest = next((quest for quest in SIDE_QUESTS if quest[0] == quest_id), None)
+        if quest is None or quest_id in self.side_quests_claimed:
+            return
+        _quest_id, title, counter, target, reward = quest
+        if self.side_quest_stats[counter] < target:
+            return
+        self.pending_side_quest_claim = quest_id
+        self.state = "side_quest_confirmation"
+
+    def handle_quest_weapons_click(self, x, y):
+        if y >= 555 and x <= 250:
+            self.state = self.quest_weapons_return_state
+            return
+        if 110 <= y <= 150:
+            if 150 <= x <= 355:
+                self.quest_weapons_tab = "quests"
+            elif 375 <= x <= 580:
+                self.quest_weapons_tab = "weapons"
+            elif 600 <= x <= 805:
+                self.open_special_loadout("quest_weapons")
+                self.special_loadout_tab = "skills"
+            return
+        if self.quest_weapons_tab == "quests" and 155 <= y < 548:
+            row = (y - 165) // 42
+            if 0 <= row < len(SIDE_QUESTS):
+                quest = SIDE_QUESTS[row]
+                if self.side_quest_stats[quest[2]] >= quest[3]:
+                    self.claim_side_quest(quest[0])
+            return
+        if self.quest_weapons_tab == "weapons" and 155 <= y < 548:
+            row = (y - 155) // 43
+            if 0 <= row < len(self.owned_special_weapons):
+                weapon_id = self.owned_special_weapons[row]
+                self.equipped_special_weapon = weapon_id
+                self.message = f'{MARKET_WEAPONS[weapon_id]["name"].upper()} EQUIPPED'
+                self.message_until = time.monotonic() + 2
+                self.save_game()
+
+    def handle_side_quest_confirmation_click(self, x, y):
+        if 410 <= y <= 480:
+            if 250 <= x <= 465:
+                quest_id = self.pending_side_quest_claim
+                quest = next((entry for entry in SIDE_QUESTS
+                              if entry[0] == quest_id), None)
+                if (quest is not None
+                        and quest_id not in self.side_quests_claimed
+                        and self.side_quest_stats[quest[2]] >= quest[3]):
+                    self.gems += quest[4]
+                    self.side_quests_claimed.add(quest_id)
+                    self.message = f"SIDE QUEST REWARD CLAIMED  +{quest[4]} GEMS"
+                    self.message_until = time.monotonic() + 3
+                    self.save_game()
+                self.pending_side_quest_claim = None
+                self.state = "quest_weapons"
+            elif 495 <= x <= 710:
+                self.pending_side_quest_claim = None
+                self.state = "quest_weapons"
 
     def skill_damage_range(self, skill):
         if skill[0] in self.crafted_skill_data:
@@ -879,6 +998,15 @@ class BattlefieldRPG:
             if 50 <= event.x <= 250 and event.y >= 555:
                 self.state = self.side_quests_return_state
             return
+        if self.state == "quest_weapons":
+            self.handle_quest_weapons_click(event.x, event.y)
+            return
+        if self.state == "side_quest_confirmation":
+            self.handle_side_quest_confirmation_click(event.x, event.y)
+            return
+        if self.state == "coin_gems":
+            self.handle_coin_gems_click(event.x, event.y)
+            return
         if self.state == "menu":
             if 165 <= event.x <= 465 and 331 <= event.y <= 381:
                 if self.has_save():
@@ -894,13 +1022,15 @@ class BattlefieldRPG:
             elif 495 <= event.x <= 795 and 398 <= event.y <= 448:
                 if self.has_save():
                     self.load_game()
-                self.open_special_loadout("menu")
+                self.open_quest_weapons("menu")
+            elif 165 <= event.x <= 795 and 465 <= event.y <= 515:
+                if self.has_save():
+                    self.load_game()
+                self.state = "character"
             return
         if self.state == "tower_exterior":
             if 340 <= event.x <= 620 and 330 <= event.y <= 500:
                 self.start_opening_cutscene()
-            elif 760 <= event.x <= 930 and 20 <= event.y <= 58:
-                self.open_floor_progression("tower_exterior")
             return
         if self.state == "tower_gate":
             self.message = "FIND THE PORTAL BEHIND THE THRONE, THEN PRESS E"
@@ -948,10 +1078,10 @@ class BattlefieldRPG:
                 self.state = "playing"
                 self.last_tick = time.monotonic()
             elif 370 <= event.x <= 590 and 390 <= event.y <= 440:
-                self.state = "character"
+                self.save_game()
+                self.state = "menu"
+                self.keys.clear()
             elif 370 <= event.x <= 590 and 460 <= event.y <= 510:
-                self.open_floor_progression("paused")
-            elif 370 <= event.x <= 590 and 530 <= event.y <= 580:
                 self.restart_floor()
             return
         if self.state == "shop":
@@ -1087,7 +1217,7 @@ class BattlefieldRPG:
         if key == "q" and not was_down and self.state in (
                 "playing", "paused", "floor_progression", "marketplace",
                 "skill_market", "skill_forge"):
-            self.open_side_quests(self.state)
+            self.open_quest_weapons(self.state)
             return
         if key in ("return", "space") and self.state == "menu":
             self.load_game() if self.has_save() else self.start_game()
@@ -1118,9 +1248,6 @@ class BattlefieldRPG:
                 return
             self.map_return_state = self.state
             self.state = "region_map"
-        elif key == "p" and not was_down and self.state in (
-                "playing", "paused", "tower_exterior"):
-            self.open_floor_progression(self.state)
         elif self.state == "marketplace" and key in ("backspace", "escape"):
             if key == "backspace":
                 self.market_search = self.market_search[:-1]
@@ -1136,8 +1263,6 @@ class BattlefieldRPG:
             self.market_search += key
         elif key == "b" and not was_down and self.state == "post_boss":
             self.open_shop()
-        elif key == "c" and not was_down and self.state == "paused":
-            self.state = "character"
         elif key == "return" and self.state == "stage_intro":
             self.state = "playing"
         elif key in ("e", "return", "space") and self.state == "tower_exterior":
@@ -1170,10 +1295,17 @@ class BattlefieldRPG:
                 self.cancel_market_purchase()
             elif self.state == "side_quests":
                 self.state = self.side_quests_return_state
+            elif self.state == "quest_weapons":
+                self.state = self.quest_weapons_return_state
+            elif self.state == "side_quest_confirmation":
+                self.pending_side_quest_claim = None
+                self.state = "quest_weapons"
+            elif self.state == "coin_gems":
+                self.state = self.coin_gems_return_state
             elif self.state == "special_loadout":
                 self.state = self.special_loadout_return_state
             elif self.state == "character":
-                self.state = "paused"
+                self.state = "menu"
             elif self.state == "auto_aim_prompt":
                 self.resolve_auto_aim_prompt(False)
 
@@ -1227,6 +1359,8 @@ class BattlefieldRPG:
             "gems": self.gems,
             "side_quest_stats": self.side_quest_stats,
             "side_quests_claimed": sorted(self.side_quests_claimed),
+            "side_quests_notified": sorted(self.side_quests_notified),
+            "side_quest_popup_queue": self.side_quest_popup_queue,
             "kills": self.kills,
             "region": self.region,
             "territories": self.territories,
@@ -1328,6 +1462,28 @@ class BattlefieldRPG:
                 quest_id for quest_id in saved_side_quests_claimed
                 if isinstance(quest_id, str) and quest_id in valid_side_quest_ids
             }
+            saved_side_quests_notified = data.get(
+                "side_quests_notified", saved_side_quests_claimed
+            )
+            if not isinstance(saved_side_quests_notified, list):
+                raise ValueError("Invalid side quest notification state")
+            side_quests_notified = {
+                quest_id for quest_id in saved_side_quests_notified
+                if isinstance(quest_id, str) and quest_id in valid_side_quest_ids
+            }
+            saved_side_quest_popup_queue = data.get("side_quest_popup_queue", [])
+            if not isinstance(saved_side_quest_popup_queue, list):
+                raise ValueError("Invalid side quest notifications")
+            side_quest_popup_queue = [
+                (item[0], item[1])
+                for item in saved_side_quest_popup_queue
+                if (isinstance(item, list) and len(item) == 2
+                    and isinstance(item[0], str)
+                    and item[0] in valid_side_quest_ids
+                    and isinstance(item[1], str)
+                    and item[0] in side_quests_notified
+                    and item[0] not in side_quests_claimed)
+            ]
             original_stats_data = data.get("superhuman_original_stats")
             superhuman_original_stats = None
             if original_stats_data is not None:
@@ -1472,6 +1628,10 @@ class BattlefieldRPG:
             self.gems = gems
             self.side_quest_stats = side_quest_stats
             self.side_quests_claimed = side_quests_claimed
+            self.side_quests_notified = side_quests_notified
+            self.side_quest_popup_queue = side_quest_popup_queue
+            self.side_quest_popup_title = ""
+            self.side_quest_popup_until = 0
             self.kills = kills
             self.floor_kills_start = max(
                 0, min(int(data.get("floor_kills_start", kills)), kills)
@@ -1761,7 +1921,7 @@ class BattlefieldRPG:
                 difficulty = 0
             base_hp = MINION_DIFFICULTIES[difficulty][1]
         else:
-            base_hp = 1_000 + (floor - 1) * 5_000
+            base_hp = 1_000 + (floor - 1) * 1_000
         self.enemies.append(
             {
                 "x": x,
@@ -2288,7 +2448,7 @@ class BattlefieldRPG:
 
     def handle_market_click(self, x, y):
         if 410 <= x <= 570 and 50 <= y <= 100:
-            self.open_side_quests("marketplace")
+            self.open_quest_weapons("marketplace")
             return
         if 760 <= x <= 915 and 50 <= y <= 100:
             self.open_skill_forge()
@@ -2452,11 +2612,14 @@ class BattlefieldRPG:
             self.save_game()
 
     def handle_character_click(self, x, y):
+        if 640 <= x <= 920 and 450 <= y <= 495:
+            self.open_coin_gems("character")
+            return
         if 640 <= x <= 920 and 505 <= y <= 545:
             self.open_special_loadout("character")
             return
         if 70 <= x <= 260 and 550 <= y <= 600:
-            self.state = "paused"
+            self.state = "menu"
             return
         if 125 <= y <= 170:
             category_index = (x - 30) // 180
@@ -3704,7 +3867,7 @@ class BattlefieldRPG:
                       fill="#c2c7b9", font=("Segoe UI", 8, "bold"), tags="frame")
         c.create_rectangle(410, 50, 570, 100, fill="#53634d",
                            outline="#d4bd91", tags="frame")
-        c.create_text(490, 75, text="SIDE QUESTS",
+        c.create_text(490, 75, text="QUEST / WEAPONS",
                       fill="#fff1d2", font=("Segoe UI", 10, "bold"),
                       tags="frame")
         c.create_rectangle(760, 50, 915, 100, fill="#53634d",
@@ -3717,6 +3880,11 @@ class BattlefieldRPG:
         c.create_text(665, 75, text="SKILL MARKET",
                       fill="#fff1d2", font=("Segoe UI", 9, "bold"),
                       tags="frame")
+        c.create_text(
+            WIDTH / 2, 107,
+            text="GEM TIERS BY WEAPON PRICE/STRENGTH: 5,000 COINS OR LESS = 5 GEMS  |  8,000 = 7  |  11,000 = 10  |  ABOVE = 15",
+            fill="#c2c7b9", font=("Segoe UI", 7, "bold"), tags="frame"
+        )
         visible = self.visible_market_weapons()
         pages = max(1, (len(visible) + 9) // 10)
         self.market_page = min(self.market_page, pages - 1)
@@ -3758,8 +3926,13 @@ class BattlefieldRPG:
                       fill="#f0d7c5", font=("Segoe UI", 27, "bold"), tags="frame")
         c.create_text(
             WIDTH / 2, 82,
-            text=f"COINS: {self.coins:,}  |  GEMS: {self.gems}  |  1 GEM = 1,000 COINS (ROUNDED UP)",
-            fill="#e5c874", font=("Segoe UI", 10, "bold"), tags="frame"
+            text=f"COINS: {self.coins:,}  |  GEMS: {self.gems}  |  GEM PRICE BY STRENGTH: 5 / 7 / 10 / 15",
+            fill="#e5c874", font=("Segoe UI", 9, "bold"), tags="frame"
+        )
+        c.create_text(
+            WIDTH / 2, 105,
+            text="UP TO 5,000 COINS = 5 GEMS  |  UP TO 8,000 = 7  |  UP TO 11,000 = 10  |  ABOVE = 15",
+            fill="#c2c7b9", font=("Segoe UI", 7, "bold"), tags="frame"
         )
         for index, skill in enumerate(ALL_BOSS_SKILLS):
             y = 125 + index * 58
@@ -3791,41 +3964,184 @@ class BattlefieldRPG:
                           fill="#e5c874", font=("Segoe UI", 10, "bold"),
                           tags="frame")
 
-    def draw_side_quests(self):
+    def draw_quest_weapons(self):
         c = self.canvas
         c.create_rectangle(0, 0, WIDTH, HEIGHT, fill="#101718", tags="frame")
-        c.create_text(WIDTH / 2, 38, text="SIDE QUESTS",
+        c.create_text(WIDTH / 2, 38, text="QUEST / WEAPONS",
                       fill="#f0d7c5", font=("Segoe UI", 25, "bold"), tags="frame")
         c.create_text(WIDTH / 2, 76,
-                      text=f"GEMS: {self.gems}  |  NO TIME LIMIT  |  REWARDS ARE PAID AUTOMATICALLY",
+                      text=f"COINS: {self.coins:,}  |  GEMS: {self.gems}",
                       fill="#e5c874", font=("Segoe UI", 10, "bold"), tags="frame")
-        for index, (quest_id, title, counter, target, reward) in enumerate(SIDE_QUESTS):
-            y = 105 + index * 49
-            progress = min(target, self.side_quest_stats[counter])
-            completed = quest_id in self.side_quests_claimed
+        for x1, x2, tab, label in (
+                (150, 355, "quests", "SIDE QUESTS"),
+                (375, 580, "weapons", "SPECIAL WEAPONS"),
+                (600, 805, "skills", "BOSS SKILLS")):
+            selected = self.quest_weapons_tab == tab
             c.create_rectangle(
-                70, y, 890, y + 42,
-                fill="#35443d" if completed else "#29332f",
-                outline="#a5d46d" if completed else "#69766b",
-                width=2 if completed else 1, tags="frame"
+                x1, 110, x2, 150,
+                fill="#53634d" if selected else "#35443d",
+                outline="#d4bd91", tags="frame"
             )
-            c.create_text(92, y + 21, anchor="w", text=title,
-                          fill="#f0d7c5", font=("Segoe UI", 10, "bold"),
+            c.create_text((x1 + x2) / 2, 130, text=label,
+                          fill="#fff1d2", font=("Segoe UI", 9, "bold"),
                           tags="frame")
+        if self.quest_weapons_tab == "quests":
             c.create_text(
-                650, y + 21, anchor="e",
-                text=("COMPLETE" if completed else f"{progress}/{target}"),
-                fill="#a5d46d" if completed else "#c2c7b9",
-                font=("Segoe UI", 9, "bold"), tags="frame"
+                WIDTH / 2, 154,
+                text="NO TIME LIMIT  |  COMPLETE A QUEST, THEN CLAIM ITS GEM REWARD HERE",
+                fill="#c2c7b9", font=("Segoe UI", 8, "bold"), tags="frame"
             )
-            c.create_text(860, y + 21, anchor="e", text=f"+{reward} GEMS",
-                          fill="#e5c874", font=("Segoe UI", 9, "bold"),
+            for index, (quest_id, title, counter, target, reward) in enumerate(SIDE_QUESTS):
+                y = 165 + index * 42
+                progress = min(target, self.side_quest_stats[counter])
+                complete = progress >= target
+                claimed = quest_id in self.side_quests_claimed
+                status = (
+                    "CLAIMED" if claimed
+                    else ("CLAIM REWARD" if complete else f"{progress}/{target}")
+                )
+                c.create_rectangle(
+                    52, y, 908, y + 36,
+                    fill="#35443d" if claimed else "#29332f",
+                    outline="#a5d46d" if complete else "#69766b",
+                    width=2 if complete else 1, tags="frame"
+                )
+                c.create_text(70, y + 18, anchor="w", text=title,
+                              fill="#f0d7c5", font=("Segoe UI", 9, "bold"),
+                              tags="frame")
+                c.create_text(660, y + 18, anchor="e", text=status,
+                              fill="#a5d46d" if complete else "#c2c7b9",
+                              font=("Segoe UI", 8, "bold"), tags="frame")
+                c.create_text(890, y + 18, anchor="e",
+                              text=f"+{reward} GEMS",
+                              fill="#e5c874", font=("Segoe UI", 8, "bold"),
+                              tags="frame")
+        elif self.quest_weapons_tab == "weapons":
+            if not self.owned_special_weapons:
+                c.create_text(
+                    WIDTH / 2, 290,
+                    text="NO SPECIAL WEAPONS OWNED  -  BUY THEM IN THE MARKETPLACE",
+                    fill="#c2c7b9", font=("Segoe UI", 11, "bold"), tags="frame"
+                )
+            for index, weapon_id in enumerate(self.owned_special_weapons[:9]):
+                weapon = MARKET_WEAPONS[weapon_id]
+                y = 160 + index * 42
+                equipped = weapon_id == self.equipped_special_weapon
+                c.create_rectangle(
+                    52, y, 908, y + 36,
+                    fill="#46523e" if equipped else "#29332f",
+                    outline="#e5c874" if equipped else "#69766b",
+                    tags="frame"
+                )
+                c.create_text(72, y + 18, anchor="w",
+                              text=f'{weapon["name"]} [{weapon["type"]}]',
+                              fill="#f0d7c5", font=("Segoe UI", 9, "bold"),
+                              tags="frame")
+                c.create_text(890, y + 18, anchor="e",
+                              text="EQUIPPED" if equipped else "CLICK TO EQUIP",
+                              fill="#e5c874", font=("Segoe UI", 8, "bold"),
+                              tags="frame")
+            c.create_text(WIDTH / 2, 555,
+                          text=f"{len(self.owned_special_weapons)} OWNED  |  CLICK A WEAPON TO EQUIP",
+                          fill="#c2c7b9", font=("Segoe UI", 9, "bold"),
                           tags="frame")
         c.create_rectangle(50, 555, 250, 600, fill="#35443d",
                            outline="#d4bd91", tags="frame")
         c.create_text(150, 577, text="BACK",
                       fill="#fff1d2", font=("Segoe UI", 10, "bold"),
                       tags="frame")
+
+    def draw_side_quest_confirmation(self):
+        quest = next((entry for entry in SIDE_QUESTS
+                      if entry[0] == self.pending_side_quest_claim), None)
+        if quest is None:
+            self.state = "quest_weapons"
+            return
+        _quest_id, title, counter, target, reward = quest
+        progress = min(target, self.side_quest_stats[counter])
+        can_claim = (
+            progress >= target
+            and quest[0] not in self.side_quests_claimed
+        )
+        c = self.canvas
+        c.create_rectangle(0, 0, WIDTH, HEIGHT, fill="#101718", tags="frame")
+        c.create_rectangle(170, 130, 790, 515, fill="#202a27",
+                           outline="#d4bd91", width=2, tags="frame")
+        c.create_text(WIDTH / 2, 175, text="CLAIM SIDE QUEST REWARD?",
+                      fill="#f0d7c5", font=("Segoe UI", 23, "bold"), tags="frame")
+        c.create_text(WIDTH / 2, 230, text=title,
+                      fill="#e5c874", font=("Segoe UI", 16, "bold"), tags="frame")
+        c.create_text(WIDTH / 2, 285, text=f"PROGRESS: {progress}/{target}",
+                      fill="#c2c7b9", font=("Segoe UI", 12, "bold"), tags="frame")
+        c.create_text(WIDTH / 2, 330, text=f"GEM REWARD: +{reward}",
+                      fill="#e5c874", font=("Segoe UI", 16, "bold"), tags="frame")
+        c.create_text(
+            WIDTH / 2, 370,
+            text=f"CURRENT: {self.gems} GEMS  |  AFTER CLAIM: {self.gems + reward} GEMS",
+            fill="#8ee5f0", font=("Segoe UI", 11, "bold"), tags="frame"
+        )
+        for x1, x2, label in (
+                (250, 465, "CLAIM REWARD" if can_claim else "UNAVAILABLE"),
+                (495, 710, "CANCEL")):
+            c.create_rectangle(
+                x1, 410, x2, 480,
+                fill="#53634d" if can_claim and x1 == 250 else "#35443d",
+                outline="#d4bd91", tags="frame"
+            )
+            c.create_text((x1 + x2) / 2, 445, text=label,
+                          fill="#fff1d2", font=("Segoe UI", 10, "bold"),
+                          tags="frame")
+
+    def draw_coin_gems(self):
+        c = self.canvas
+        c.create_rectangle(0, 0, WIDTH, HEIGHT, fill="#101718", tags="frame")
+        c.create_text(WIDTH / 2, 70, text="COIN ⇄ GEMS",
+                      fill="#f0d7c5", font=("Segoe UI", 26, "bold"), tags="frame")
+        c.create_text(WIDTH / 2, 120,
+                      text=f"CURRENT BALANCE: {self.coins:,} COINS  |  {self.gems} GEMS",
+                      fill="#e5c874", font=("Segoe UI", 13, "bold"), tags="frame")
+        c.create_text(WIDTH / 2, 155,
+                      text=f"FIXED, TWO-WAY RATE: {COINS_PER_GEM:,} COINS = 1 GEM",
+                      fill="#c2c7b9", font=("Segoe UI", 10, "bold"), tags="frame")
+        for index, amount in enumerate((1, 5, 10)):
+            y = 180 + index * 80
+            coin_cost = amount * COINS_PER_GEM
+            c.create_rectangle(90, y, 465, y + 62, fill="#35443d",
+                               outline="#d4bd91", tags="frame")
+            c.create_text(277, y + 31,
+                          text=f"EXCHANGE {coin_cost:,} COINS → {amount} GEMS",
+                          fill="#fff1d2", font=("Segoe UI", 10, "bold"),
+                          tags="frame")
+            c.create_rectangle(495, y, 870, y + 62, fill="#35443d",
+                               outline="#d4bd91", tags="frame")
+            c.create_text(682, y + 31,
+                          text=f"EXCHANGE {amount} GEMS → {coin_cost:,} COINS",
+                          fill="#fff1d2", font=("Segoe UI", 10, "bold"),
+                          tags="frame")
+        c.create_rectangle(50, 555, 250, 600, fill="#35443d",
+                           outline="#d4bd91", tags="frame")
+        c.create_text(150, 577, text="BACK TO CHARACTER",
+                      fill="#fff1d2", font=("Segoe UI", 9, "bold"),
+                      tags="frame")
+        if time.monotonic() < self.message_until:
+            c.create_text(WIDTH / 2, 455, text=self.message,
+                          fill="#e5c874", font=("Segoe UI", 10, "bold"),
+                          tags="frame")
+
+    def draw_side_quest_completion_popup(self, now):
+        self.show_next_side_quest_popup()
+        if now >= self.side_quest_popup_until or not self.side_quest_popup_title:
+            return
+        c = self.canvas
+        c.create_rectangle(90, 215, 870, 385, fill="#f4c7a1",
+                           outline="#080808", width=5, tags="frame")
+        c.create_text(WIDTH / 2, 260, text="SIDE QUEST COMPLETED!",
+                      fill="#eb7628",
+                      font=("Segoe UI", 24, "bold"), tags="frame")
+        c.create_text(WIDTH / 2, 325,
+                      text=self.side_quest_popup_title.upper(),
+                      fill="#ef7024",
+                      width=720, font=("Segoe UI", 22, "bold"), tags="frame")
 
     def draw_weapon_preview(self):
         if self.preview_weapon_id is None:
@@ -3923,7 +4239,8 @@ class BattlefieldRPG:
         c.create_text(
             722, 562,
             text=("OWNED - EQUIP IN SPECIAL WEAPONS" if owned
-                  else f"BUY FOR {weapon['price']:,} COINS"),
+                  else (f"BUY FOR {weapon['price']:,} COINS OR "
+                        f"{self.gem_price(weapon['price'])} GEMS")),
             fill="#e5c874" if not owned else "#929c93",
             font=("Segoe UI", 9, "bold"), tags="frame"
         )
@@ -4633,7 +4950,7 @@ class BattlefieldRPG:
                                     fill="#f0d99f", font=("Segoe UI", 12, "bold"),
                                     tags="frame")
         self.canvas.create_text(WIDTH / 2, HEIGHT - 22,
-                                text="MOVE: WASD   SHOOT: SPACE/CLICK   SKILLS: 1-5   AIM: RIGHT-CLICK   E: INTERACT   `: LOADOUT   Q: SIDE QUESTS",
+                                text="MOVE: WASD   SHOOT: SPACE/CLICK   SKILLS: 1-5   AIM: RIGHT-CLICK   E: INTERACT   `: LOADOUT   Q: QUEST/WEAPONS",
                                 fill="#b9c1ac", font=("Segoe UI", 9, "bold"), tags="frame")
         self.draw_skill_dialogue()
         if self.active_quest:
@@ -4791,10 +5108,6 @@ class BattlefieldRPG:
     def draw_tower_exterior(self):
         c = self.canvas
         c.create_rectangle(0, 0, WIDTH, HEIGHT, fill="#121619", tags="frame")
-        c.create_rectangle(760, 20, 930, 58, fill="#35443d",
-                           outline="#d4bd91", tags="frame")
-        c.create_text(845, 39, text="FLOOR STAIRS  P",
-                      fill="#fff1d2", font=("Segoe UI", 9, "bold"), tags="frame")
         for x in range(0, WIDTH, 80):
             c.create_line(x, 0, WIDTH / 2, 370, fill="#20282a", width=2,
                           tags="frame")
@@ -5355,7 +5668,8 @@ class BattlefieldRPG:
         self.canvas.create_text(WIDTH / 2, 58, text="CHARACTER CUSTOMIZATION",
                                 fill="#f0d7c5", font=("Segoe UI", 25, "bold"),
                                 tags="frame")
-        self.canvas.create_text(WIDTH - 50, 94, text=f"COINS: {self.coins}",
+        self.canvas.create_text(WIDTH - 50, 94,
+                                text=f"COINS: {self.coins:,}  |  GEMS: {self.gems}",
                                 anchor="e", fill="#e5c874",
                                 font=("Segoe UI", 12, "bold"), tags="frame")
 
@@ -5424,9 +5738,15 @@ class BattlefieldRPG:
                                 tags="frame")
         self.canvas.create_rectangle(70, 550, 260, 600, fill="#53634d",
                                      outline="#d4bd91", width=1, tags="frame")
-        self.canvas.create_text(165, 575, text="BACK TO PAUSE",
+        self.canvas.create_text(165, 575, text="BACK TO MAIN MENU",
                                 fill="#fff1d2", font=("Segoe UI", 10, "bold"),
                                 tags="frame")
+        self.canvas.create_rectangle(640, 450, 920, 495, fill="#35443d",
+                                     outline="#d4bd91", width=1, tags="frame")
+        self.canvas.create_text(
+            780, 472, text="COIN⇄GEMS",
+            fill="#e5c874", font=("Segoe UI", 10, "bold"), tags="frame"
+        )
         self.canvas.create_rectangle(640, 505, 920, 545, fill="#35443d",
                                      outline="#d4bd91", width=1, tags="frame")
         equipped_special = (
@@ -5438,7 +5758,7 @@ class BattlefieldRPG:
             fill="#8ee5f0", font=("Segoe UI", 9, "bold"), tags="frame"
         )
         if time.monotonic() < self.message_until:
-            self.canvas.create_text(770, 470, text=self.message,
+            self.canvas.create_text(330, 470, text=self.message,
                                     fill="#e5c874", font=("Segoe UI", 10, "bold"),
                                     tags="frame")
 
@@ -5590,9 +5910,8 @@ class BattlefieldRPG:
         self.canvas.create_text(WIDTH / 2, 276, text="The frontline is waiting.",
                                 fill="#c2c7b9", font=("Segoe UI", 12), tags="frame")
         for y1, y2, label in ((320, 370, "RESUME  -  ESC"),
-                              (390, 440, "CHANGE CHARACTER  -  C"),
-                              (460, 510, "FLOOR PROGRESSION  -  P"),
-                              (530, 580, "RESTART FLOOR")):
+                              (390, 440, "BACK TO MAIN MENU"),
+                              (460, 510, "RESTART FLOOR")):
             self.canvas.create_rectangle(370, y1, 590, y2, fill="#53634d",
                                          outline="#d4bd91", width=1, tags="frame")
             self.canvas.create_text(WIDTH / 2, (y1 + y2) / 2, text=label,
@@ -5721,21 +6040,26 @@ class BattlefieldRPG:
         self.canvas.create_rectangle(495, 398, 795, 448, fill="#35443d",
                                      outline="#d4bd91", width=1, tags="frame")
         self.canvas.create_text(
-            645, 423, text=f"SPECIAL WEAPONS  ({len(self.owned_special_weapons)} OWNED)",
+            645, 423, text=f"QUEST / WEAPONS  ({len(self.owned_special_weapons)} OWNED)",
             fill="#8ee5f0", font=("Segoe UI", 10, "bold"), tags="frame"
         )
+        self.canvas.create_rectangle(165, 465, 795, 515, fill="#35443d",
+                                     outline="#d4bd91", width=1, tags="frame")
+        self.canvas.create_text(480, 490, text="CHARACTER CUSTOMIZATION",
+                                fill="#fff1d2", font=("Segoe UI", 11, "bold"),
+                                tags="frame")
         self.canvas.create_text(
-            WIDTH / 2, 482,
+            WIDTH / 2, 540,
             text="WASD / ARROWS MOVE   SPACE / CLICK SHOOT   1-5 CAST SKILLS   ESC PAUSE",
             fill="#b7c1b4", font=("Segoe UI", 10, "bold"), tags="frame"
         )
         self.canvas.create_text(
-            WIDTH / 2, 510,
+            WIDTH / 2, 565,
             text="AUTO-SAVES EVERY 10 SECONDS  |  CTRL+SHIFT+S SAVES NOW",
             fill="#9ea99d", font=("Segoe UI", 9, "bold"), tags="frame"
         )
         if time.monotonic() < self.save_notice_until:
-            self.canvas.create_text(WIDTH / 2, 550, text=self.save_notice,
+            self.canvas.create_text(WIDTH / 2, 610, text=self.save_notice,
                                     fill="#e5c874", font=("Segoe UI", 10, "bold"),
                                     tags="frame")
 
@@ -5744,6 +6068,7 @@ class BattlefieldRPG:
         dt = min(now - self.last_tick, 0.05)
         self.last_tick = now
         self.canvas.delete("frame")
+        self.show_next_side_quest_popup()
         self.update_flow(now)
         if self.state == "tower_gate":
             self.update_tower_gate(dt)
@@ -5792,8 +6117,14 @@ class BattlefieldRPG:
             self.draw_floor_progression()
         elif self.state == "marketplace":
             self.draw_marketplace()
+        elif self.state == "quest_weapons":
+            self.draw_quest_weapons()
         elif self.state == "side_quests":
-            self.draw_side_quests()
+            self.draw_quest_weapons()
+        elif self.state == "side_quest_confirmation":
+            self.draw_side_quest_confirmation()
+        elif self.state == "coin_gems":
+            self.draw_coin_gems()
         elif self.state == "purchase_confirmation":
             self.draw_purchase_confirmation()
         elif self.state == "skill_market":
@@ -5818,6 +6149,7 @@ class BattlefieldRPG:
                               "REDEPLOY  -  ENTER")
         elif self.state == "victory":
             self.draw_victory()
+        self.draw_side_quest_completion_popup(now)
         self.root.after(33, self.tick)
 
 
